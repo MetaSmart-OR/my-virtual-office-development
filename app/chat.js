@@ -7,6 +7,7 @@
   let pendingCallbacks = {};
   let _chatWsPort = 8091;
   let _modelBarInterval = null;
+  let _sessionsListCache = { at: 0, promise: null, payload: null };
   const runOwners = new Map();
 
   const MAX_INPUT_LINES = 15;
@@ -33,6 +34,7 @@
       this.hasExplicitAgentSelection = false;
       this.currentRunId = null;
       this.streamingMsg = null;
+      this.liveToolCards = new Map();
       this.sessionModel = '—';
       this.contextWindow = 0;
       this.contextUsed = 0;
@@ -229,18 +231,22 @@
       }
     }
 
+    isVisibleForPolling() {
+      return this.isPrimary ? this.root.classList.contains('open') : this.root.classList.contains('open');
+    }
+
     async fetchContextUsage() {
+      if (!this.isVisibleForPolling()) return;
       try {
-        const res = await rpc('sessions.list', {});
-        if (res.ok && res.payload?.sessions?.length) {
-          const s = res.payload.sessions.find(x => x.key === this.sessionKey);
-          if (!s) return;
-          if (s.totalTokens > 0) this.contextUsed = s.totalTokens;
-          if (s.contextTokens > 0 && s.contextTokens > this.contextWindow) this.contextWindow = s.contextTokens;
-          // Don't update model from gateway transcript — it can be stale.
-          // Model display is driven by fetchSessionInfo() from server config.
-          this.updateModelBar();
-        }
+        // Avoid broad sessions.list polling. Describe only the selected session.
+        const res = await rpc('sessions.describe', { key: this.sessionKey });
+        const s = res?.payload?.session;
+        if (!res.ok || !s) return;
+        if (s.totalTokens > 0) this.contextUsed = s.totalTokens;
+        if (s.contextTokens > 0 && s.contextTokens > this.contextWindow) this.contextWindow = s.contextTokens;
+        // Don't update model from gateway transcript — it can be stale.
+        // Model display is driven by fetchSessionInfo() from server config.
+        this.updateModelBar();
       } catch (e) {
         console.warn('[chat] Failed to fetch context usage:', e);
       }
@@ -255,16 +261,15 @@
     async fetchSessionInfo() {
       let gatewayContext = 0;
       try {
-        const res = await rpc('sessions.list', {});
-        if (res.ok && res.payload?.sessions?.length) {
-          const s = res.payload.sessions.find(x => x.key === this.sessionKey);
-          if (s) {
-            if (s.totalTokens > 0) this.contextUsed = s.totalTokens;
-            if (s.contextTokens > 0) gatewayContext = s.contextTokens;
-          }
+        // Targeted lookup avoids rebuilding the full sessions.list index.
+        const res = await rpc('sessions.describe', { key: this.sessionKey });
+        const s = res?.payload?.session;
+        if (res.ok && s) {
+          if (s.totalTokens > 0) this.contextUsed = s.totalTokens;
+          if (s.contextTokens > 0) gatewayContext = s.contextTokens;
         }
       } catch (e) {
-        console.warn('[chat] sessions.list failed:', e);
+        console.warn('[chat] sessions.describe failed:', e);
       }
       let serverContext = 0;
       try {
@@ -294,7 +299,8 @@
             const t = extractText(msg) || (typeof msg.content === 'string' ? msg.content : '');
             const ts = msg.timestamp || msg.ts || msg.message?.timestamp || null;
             const media = extractMedia(msg, t);
-            if (t || media.length) this.appendMessage(msg.role, t, ts, media);
+            const tools = extractToolItems(msg);
+            if (t || media.length || tools.length) this.appendMessage(msg.role, t, ts, media, resolveMessageSender(msg, this), tools);
           }
           this.scrollBottom();
         }
@@ -313,6 +319,7 @@
           this.messages.innerHTML = '';
           this.streamingMsg = null;
           this.currentRunId = null;
+          this.liveToolCards.clear();
           this.appendSystem('New session started');
         } else {
           this.appendSystem('Reset failed: ' + JSON.stringify(res.error || res));
@@ -394,7 +401,7 @@
       const imageDataUrls = this.pendingAttachments.filter(a => a.mimeType.startsWith('image/')).map(a => a.dataUrl);
       const nonImageNames = this.pendingAttachments.filter(a => !a.mimeType.startsWith('image/')).map(a => a.name);
       if (nonImageNames.length) displayText += (displayText ? '\n' : '') + '📎 ' + nonImageNames.join(', ');
-      this.appendMessage('user', displayText, Date.now(), imageDataUrls);
+      this.appendMessage('user', displayText, Date.now(), imageDataUrls, { label: 'You', kind: 'human' });
       this.scrollBottom();
 
       let attachments;
@@ -578,6 +585,7 @@
           this.appendMessage('assistant', finalText);
         }
         this.fetchContextUsage();
+        if (payload?.runId) this.finalizeRunToolCards(payload.runId);
         if (payload?.runId) runOwners.delete(payload.runId);
         this.currentRunId = null;
         this.scrollBottom();
@@ -586,23 +594,50 @@
 
     handleAgentEvent(payload) {
       if (!this.ownsPayload(payload)) return;
-      if (payload?.type === 'thinking') {
+
+      const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
+      const stream = payload?.stream || data.stream || '';
+      const phase = data.phase || payload?.phase || '';
+
+      // Current OpenClaw emits tool activity as agent events:
+      // { stream:"tool", data:{ phase:"start|update|result", name, toolCallId, args, result } }
+      if (stream === 'tool' || payload?.type === 'tool_start' || payload?.type === 'tool_end' || payload?.type === 'tool_result') {
+        const tool = normalizeToolEvent(payload, phase === 'result' ? 'done' : 'running');
+        const label = formatToolLabel(tool.name, coerceToolArgs(tool.arguments));
+        if (phase === 'start' || payload?.type === 'tool_start') {
+          this.updateTypingIndicator(label);
+          this.appendToolCall(payload);
+        } else if (phase === 'update') {
+          this.updateTypingIndicator(label);
+          this.updateToolCall(payload);
+        } else if (phase === 'result' || phase === 'end' || payload?.type === 'tool_end' || payload?.type === 'tool_result') {
+          this.finishToolCall(payload);
+          this.updateTypingIndicator('Processing...');
+        } else {
+          this.updateTypingIndicator(label);
+          this.appendToolCall(payload);
+        }
+        return;
+      }
+
+      if (payload?.type === 'thinking' || stream === 'lifecycle' && phase === 'start') {
         this.updateTypingIndicator('Thinking...');
-      } else if (payload?.type === 'tool_start') {
-        const label = formatToolLabel(payload.name, payload.arguments || {});
-        this.updateTypingIndicator(label);
-        this.appendActivity(label);
-      } else if (payload?.type === 'tool_end' || payload?.type === 'tool_result') {
-        this.updateTypingIndicator('Processing...');
       }
     }
 
-    appendMessage(role, content, ts, mediaItems) {
+    appendMessage(role, content, ts, mediaItems, meta = {}, toolItems = []) {
       const div = document.createElement('div');
       div.className = `chat-msg ${role}`;
       const bubble = document.createElement('div');
       bubble.className = 'chat-bubble';
       let displayContent = content || '';
+      const envelope = parseA2AEnvelope(displayContent);
+      if (envelope) {
+        displayContent = envelope.text;
+        meta = { ...meta, label: envelope.label, toLabel: envelope.toLabel || meta.toLabel, kind: 'agent' };
+      }
+      meta = normalizeSenderMeta(meta, role, this);
+      if (meta.kind) div.dataset.senderKind = meta.kind;
       if (role === 'tool' && displayContent.length > 3000) {
         displayContent = displayContent.substring(0, 2000) + '\n\n... [truncated - ' + displayContent.length + ' chars total] ...';
       }
@@ -615,11 +650,14 @@
       if (media.length) {
         bubble.appendChild(renderChatMedia(media));
       }
+      const senderHeader = renderSenderHeader(meta, role);
+      if (senderHeader) bubble.appendChild(senderHeader);
       if (displayContent.trim()) {
         const textDiv = document.createElement('div');
         textDiv.innerHTML = formatContent(displayContent);
         bubble.appendChild(textDiv);
       }
+      for (const tool of toolItems) bubble.appendChild(renderToolCallCard(tool, { historical: true }));
       if (ts) {
         const time = document.createElement('span');
         time.className = 'chat-time';
@@ -657,6 +695,8 @@
       const bubble = div.querySelector('.chat-bubble');
       bubble.classList.remove('streaming');
       bubble.innerHTML = '';
+      const senderHeader = renderSenderHeader(normalizeSenderMeta({}, 'assistant', this), 'assistant');
+      if (senderHeader) bubble.appendChild(senderHeader);
       const media = normalizeChatMedia(mediaItems || extractMedia({ content }, content));
       if (media.length) bubble.appendChild(renderChatMedia(media));
       if ((content || '').trim()) {
@@ -699,6 +739,67 @@
 
     clearActivityFeed() { this.messages.querySelectorAll('.chat-activity').forEach(el => el.remove()); }
     scrollBottom() { this.messages.scrollTop = this.messages.scrollHeight; }
+
+    toolKey(payload) {
+      const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
+      const id = data.toolCallId || payload?.toolCallId || payload?.callId || payload?.id;
+      const runId = payload?.runId || data.runId || this.currentRunId || 'run';
+      const name = data.name || payload?.name || payload?.tool || payload?.toolName || 'tool';
+      return id || `${runId}:${name}:${this.liveToolCards.size}`;
+    }
+
+    appendToolCall(payload) {
+      const tool = normalizeToolEvent(payload, 'running');
+      const key = this.toolKey(payload);
+      tool.key = key;
+      const existing = this.liveToolCards.get(key);
+      if (existing) {
+        updateToolCallCard(existing.querySelector('.chat-tool-call'), tool);
+        return;
+      }
+      const wrap = document.createElement('div');
+      wrap.className = 'chat-msg assistant chat-tool-msg';
+      wrap.dataset.runId = payload?.runId || tool.runId || this.currentRunId || '';
+      wrap.dataset.toolKey = key;
+      wrap.appendChild(renderToolCallCard(tool, { live: true }));
+      const ind = this.messages.querySelector('.typing-indicator');
+      if (ind) this.messages.insertBefore(wrap, ind);
+      else this.messages.appendChild(wrap);
+      this.liveToolCards.set(key, wrap);
+      this.scrollBottom();
+    }
+
+    updateToolCall(payload) {
+      const key = this.toolKey(payload);
+      const wrap = this.liveToolCards.get(key);
+      if (!wrap) return this.appendToolCall(payload);
+      updateToolCallCard(wrap.querySelector('.chat-tool-call'), normalizeToolEvent(payload, 'running'));
+      this.scrollBottom();
+    }
+
+    finishToolCall(payload) {
+      let key = this.toolKey(payload);
+      let wrap = this.liveToolCards.get(key);
+      if (!wrap && this.liveToolCards.size) {
+        const sameRun = [...this.liveToolCards.entries()].reverse().find(([, el]) => !payload?.runId || el.dataset.runId === payload.runId);
+        if (sameRun) { key = sameRun[0]; wrap = sameRun[1]; }
+      }
+      if (!wrap) return;
+      const tool = normalizeToolEvent(payload, payload?.error ? 'error' : 'done');
+      const card = wrap.querySelector('.chat-tool-call');
+      updateToolCallCard(card, tool);
+      this.liveToolCards.delete(key);
+      this.scrollBottom();
+    }
+
+    finalizeRunToolCards(runId) {
+      for (const [key, wrap] of [...this.liveToolCards.entries()]) {
+        if (!runId || wrap.dataset.runId === runId) {
+          updateToolCallCard(wrap.querySelector('.chat-tool-call'), { status: 'done', result: 'Completed' });
+          this.liveToolCards.delete(key);
+        }
+      }
+    }
 
     appendActivity(text) {
       const existing = this.messages.querySelectorAll('.chat-activity');
@@ -981,7 +1082,7 @@
     _modelBarInterval = setInterval(() => {
       if (!connected) return;
       chatWindows.forEach(w => w.fetchContextUsage());
-    }, 30000);
+    }, 60000);
   }
 
   function connectGateway() {
@@ -1015,7 +1116,7 @@
       params: {
         minProtocol: 3, maxProtocol: 3,
         client: { id: 'openclaw-control-ui', version: '2026.2.9', platform: 'web', mode: 'webchat' },
-        role: 'operator', scopes: ['operator.read', 'operator.write', 'operator.admin'], caps: [], commands: [], permissions: {},
+        role: 'operator', scopes: ['operator.read', 'operator.write', 'operator.admin'], caps: ['tool-events'], commands: [], permissions: {},
         auth: { token: GATEWAY_TOKEN }, locale: 'en-US', userAgent: 'virtual-office-chat/1.0'
       }
     };
@@ -1024,8 +1125,10 @@
         connected = true;
         chatWindows.forEach(w => {
           w.setStatus('Connected ⚡', 'connected');
-          w.fetchSessionInfo();
-          if (w.isPrimary || w.root.classList.contains('open')) w.loadHistory();
+          if (w.isPrimary || w.root.classList.contains('open')) {
+            w.fetchSessionInfo();
+            w.loadHistory();
+          }
         });
         startModelBarRefresh();
       } else {
@@ -1047,10 +1150,238 @@
     });
   }
 
+  function getSessionsListCached(maxAgeMs = 2500) {
+    // Deprecated: broad sessions.list polling was replaced by targeted
+    // sessions.describe calls and the backend presence cache.
+    const now = Date.now();
+    if (_sessionsListCache.promise && now - _sessionsListCache.at < maxAgeMs) return _sessionsListCache.promise;
+    _sessionsListCache.at = now;
+    _sessionsListCache.promise = rpc('sessions.list', { limit: 100 }).then((res) => {
+      _sessionsListCache.payload = res;
+      return res;
+    }).catch((err) => {
+      _sessionsListCache.promise = null;
+      throw err;
+    });
+    return _sessionsListCache.promise;
+  }
+
   function handleEvent(msg) {
     const { event, payload } = msg;
     if (event === 'chat') chatWindows.forEach(w => w.handleChatEvent(payload));
     if (event === 'agent') chatWindows.forEach(w => w.handleAgentEvent(payload));
+  }
+
+  function agentLabelFromId(agentId) {
+    if (!agentId) return '';
+    const opt = document.querySelector(`.chat-agent-select option[value="${CSS.escape(String(agentId))}"]`);
+    return opt ? opt.textContent.trim() : String(agentId);
+  }
+
+  function getWindowAgentLabel(win) {
+    return win?.agentSelect?.selectedOptions?.[0]?.textContent?.trim() || agentLabelFromId(win?.agentSelect?.value) || 'Assistant';
+  }
+
+  function parseAgentIdFromSessionKey(sessionKey) {
+    const m = String(sessionKey || '').match(/^agent:([^:]+):/);
+    return m ? m[1] : '';
+  }
+
+  function parseA2AEnvelope(text) {
+    const m = String(text || '').match(/^\s*\[A2A\s+([^\]]+)\]\s*\n?/);
+    if (!m) return null;
+    const attrs = {};
+    const raw = m[1];
+    raw.replace(/([A-Za-z][\w-]*)=("[^"]*"|'[^']*'|\S+)/g, (_, k, v) => {
+      v = String(v || '').trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+      attrs[k] = v;
+      return '';
+    });
+    const fromId = attrs.from || '';
+    const toId = attrs.to || '';
+    return {
+      fromId,
+      toId,
+      label: attrs.name || agentLabelFromId(fromId) || fromId || 'Agent',
+      toLabel: agentLabelFromId(toId) || toId || '',
+      text: String(text || '').slice(m[0].length).trimStart()
+    };
+  }
+
+  function normalizeSenderMeta(meta, role, win) {
+    const out = { ...(meta || {}) };
+    if (!out.label) {
+      if (role === 'assistant') {
+        out.label = getWindowAgentLabel(win);
+        out.kind = out.kind || 'agent';
+      } else if (role === 'user') {
+        out.label = 'You';
+        out.kind = out.kind || 'human';
+      }
+    }
+    return out;
+  }
+
+  function resolveMessageSender(msg, win) {
+    const message = msg?.message || msg || {};
+    const role = message.role || msg?.role || '';
+    const text = extractText(msg) || (typeof message.content === 'string' ? message.content : '') || '';
+    const prov = message.provenance || msg?.provenance || {};
+    const targetLabel = getWindowAgentLabel(win);
+
+    if (role === 'assistant') return { label: targetLabel, kind: 'agent' };
+
+    if (role === 'user' && prov?.kind === 'inter_session') {
+      const sourceAgentId = parseAgentIdFromSessionKey(prov.sourceSessionKey || '');
+      return {
+        label: agentLabelFromId(sourceAgentId) || 'Agent',
+        toLabel: targetLabel,
+        kind: 'agent',
+        isInterSession: true,
+        sourceAgentId
+      };
+    }
+
+    const envelope = parseA2AEnvelope(text);
+    if (role === 'user' && envelope) {
+      return { label: envelope.label, toLabel: envelope.toLabel || targetLabel, kind: 'agent', isInterSession: true, sourceAgentId: envelope.fromId };
+    }
+
+    return { label: 'You', kind: 'human' };
+  }
+
+  function renderSenderHeader(meta, role) {
+    if (!meta?.label || role === 'system') return null;
+    const div = document.createElement('div');
+    div.className = 'chat-sender-label ' + (meta.kind === 'agent' ? 'agent' : 'human');
+    div.textContent = meta.toLabel ? `${meta.label} → ${meta.toLabel}` : meta.label;
+    return div;
+  }
+
+  function extractToolItems(msg) {
+    const c = msg?.message?.content ?? msg?.content;
+    if (!Array.isArray(c)) return [];
+    const tools = [];
+    for (const b of c) {
+      if (!b || typeof b !== 'object') continue;
+      const type = b.type || '';
+      if (type === 'toolCall' || type === 'tool_call') {
+        tools.push({
+          status: 'done',
+          name: b.name || b.toolName || b.function?.name || 'tool',
+          arguments: b.arguments || b.args || b.input || b.function?.arguments || {},
+          id: b.id || b.toolCallId || b.callId || ''
+        });
+      } else if (type === 'toolResult' || type === 'tool_result') {
+        const last = tools[tools.length - 1];
+        const result = b.result ?? b.output ?? b.content ?? b.text ?? b.error ?? '';
+        if (last && (!b.toolCallId || b.toolCallId === last.id)) {
+          last.result = result;
+          last.status = b.error ? 'error' : 'done';
+        } else {
+          tools.push({ status: b.error ? 'error' : 'done', name: b.name || 'tool result', result, id: b.toolCallId || b.id || '' });
+        }
+      }
+    }
+    return tools;
+  }
+
+  function normalizeToolEvent(payload, fallbackStatus = 'running') {
+    const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
+    const phase = data.phase || payload?.phase || '';
+    const isError = data.isError || payload?.isError || payload?.error;
+    let status = payload?.status || fallbackStatus;
+    if (phase === 'start' || phase === 'update') status = 'running';
+    if (phase === 'result' || phase === 'end') status = isError ? 'error' : 'done';
+    const result = data.result ?? data.partialResult ?? payload?.result ?? payload?.output ?? payload?.content ?? payload?.text ?? '';
+    const error = data.error || payload?.error || (isError && typeof result === 'string' ? result : '');
+    return {
+      id: data.toolCallId || payload?.toolCallId || payload?.callId || payload?.id || '',
+      runId: payload?.runId || data.runId || '',
+      status,
+      name: data.name || payload?.name || payload?.tool || payload?.toolName || 'tool',
+      arguments: data.args || data.arguments || payload?.arguments || payload?.args || payload?.input || {},
+      result,
+      error
+    };
+  }
+
+  function renderToolCallCard(tool, opts = {}) {
+    const details = document.createElement('details');
+    details.className = `chat-tool-call ${tool.status || 'running'}`;
+    if (opts.live || tool.status === 'running') details.open = true;
+    details.dataset.toolName = tool.name || 'tool';
+
+    const summary = document.createElement('summary');
+    summary.className = 'chat-tool-summary';
+    const icon = document.createElement('span');
+    icon.className = 'chat-tool-icon';
+    icon.textContent = tool.status === 'error' ? '⚠️' : tool.status === 'done' ? '✅' : '🔧';
+    const title = document.createElement('span');
+    title.className = 'chat-tool-title';
+    title.textContent = formatToolLabel(tool.name, coerceToolArgs(tool.arguments));
+    const state = document.createElement('span');
+    state.className = 'chat-tool-state';
+    state.textContent = tool.status === 'error' ? 'error' : tool.status === 'done' ? 'done' : 'running';
+    summary.append(icon, title, state);
+    details.appendChild(summary);
+
+    const body = document.createElement('div');
+    body.className = 'chat-tool-body';
+    body.appendChild(renderToolSection('Input', formatToolPayload(tool.arguments || {})));
+    if (tool.result || tool.error) body.appendChild(renderToolSection(tool.error ? 'Error' : 'Result', formatToolPayload(tool.error || tool.result)));
+    details.appendChild(body);
+    return details;
+  }
+
+  function updateToolCallCard(card, tool) {
+    if (!card) return;
+    card.classList.remove('running', 'done', 'error');
+    card.classList.add(tool.status || 'done');
+    const icon = card.querySelector('.chat-tool-icon');
+    if (icon) icon.textContent = tool.status === 'error' ? '⚠️' : tool.status === 'done' ? '✅' : '🔧';
+    const state = card.querySelector('.chat-tool-state');
+    if (state) state.textContent = tool.status === 'error' ? 'error' : tool.status === 'done' ? 'done' : 'running';
+    const title = card.querySelector('.chat-tool-title');
+    if (title) title.textContent = formatToolLabel(tool.name, coerceToolArgs(tool.arguments));
+    const body = card.querySelector('.chat-tool-body');
+    if (body) {
+      body.innerHTML = '';
+      body.appendChild(renderToolSection('Input', formatToolPayload(tool.arguments || {})));
+      if (tool.result || tool.error) body.appendChild(renderToolSection(tool.error ? 'Error' : tool.status === 'running' ? 'Progress' : 'Result', formatToolPayload(tool.error || tool.result)));
+    }
+  }
+
+  function renderToolSection(label, text) {
+    const section = document.createElement('div');
+    section.className = 'chat-tool-section';
+    const h = document.createElement('div');
+    h.className = 'chat-tool-section-label';
+    h.textContent = label;
+    const pre = document.createElement('pre');
+    pre.textContent = text || '—';
+    section.append(h, pre);
+    return section;
+  }
+
+  function coerceToolArgs(value) {
+    if (!value) return {};
+    if (typeof value === 'string') {
+      try { return JSON.parse(value); } catch { return { input: value }; }
+    }
+    return typeof value === 'object' ? value : { value };
+  }
+
+  function formatToolPayload(value) {
+    if (value == null || value === '') return '';
+    if (typeof value === 'string') return value.length > 6000 ? value.slice(0, 6000) + '\n… [truncated]' : value;
+    try {
+      const s = JSON.stringify(value, null, 2);
+      return s.length > 6000 ? s.slice(0, 6000) + '\n… [truncated]' : s;
+    } catch {
+      return String(value);
+    }
   }
 
   function extractText(msg) {

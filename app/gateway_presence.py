@@ -6,7 +6,7 @@ Connects to the gateway WebSocket, monitors session activity, and maintains
 in-memory presence state that server.py can read.
 
 Architecture:
-  Gateway WS events + sessions.list polling → in-memory state dict → server.py reads it
+  Gateway WS events + rare bootstrap snapshots → in-memory state dict → server.py reads it
 
 Does NOT modify the gateway. Read-only observer.
 """
@@ -37,15 +37,20 @@ MANUAL_OVERRIDE_TTL = 30
 # How long after last activity before an agent is considered idle
 IDLE_TIMEOUT_SEC = 120
 
-# How often to poll sessions.list
-SESSIONS_POLL_SEC = 10
+# Rare bootstrap/fallback snapshot size. Do not poll sessions.list on an interval.
+SESSIONS_BOOTSTRAP_LIMIT = 100
 
-# Track last known updatedAt per session key for change detection
+# Short grace period after a lifecycle end before showing idle, to avoid UI flicker.
+FINISHING_GRACE_SEC = 12
+
+# Track last known updatedAt per session key for change detection during rare snapshots
 _last_updated_at = {}  # session_key → updatedAt timestamp (ms)
 
 # Track real-time event activity per agent
 _last_event_at = {}   # agent_id → timestamp (seconds)
 _last_event_task = {}  # agent_id → task description from event
+_run_agents = {}       # runId → agent_id
+_finish_idle_at = {}   # agent_id → timestamp (seconds)
 
 # Manual override tracking
 _manual_overrides = {}  # agent_id → {state, task, updated, expires}
@@ -53,6 +58,14 @@ _manual_overrides = {}  # agent_id → {state, task, updated, expires}
 # Gateway connection state
 _gw_connected = False
 _gw_error = None
+_debug = {
+    "connectedAt": 0,
+    "lastEventAt": 0,
+    "lastSnapshotAt": 0,
+    "events": {},
+    "snapshots": 0,
+    "sessionListCalls": 0,
+}
 
 
 def get_state():
@@ -128,8 +141,15 @@ def end_all_meetings():
 
 
 def get_connection_status():
-    """Return gateway connection status."""
-    return {"connected": _gw_connected, "error": _gw_error}
+    """Return gateway connection/debug status."""
+    with _state_lock:
+        agents_cached = len([k for k in _state.keys() if not k.startswith("_")])
+    return {
+        "connected": _gw_connected,
+        "error": _gw_error,
+        "agentsCached": agents_cached,
+        "debug": dict(_debug),
+    }
 
 
 def init_agents(agent_ids):
@@ -144,17 +164,99 @@ def init_agents(agent_ids):
 
 def _extract_agent_id(session_key):
     """Extract agent_id from session key like 'agent:pq-mike:main'."""
-    if not session_key or not session_key.startswith("agent:"):
+    if not session_key or not str(session_key).startswith("agent:"):
         return None
-    parts = session_key.split(":")
+    parts = str(session_key).split(":")
     if len(parts) >= 2:
         return parts[1]
     return None
 
 
+def _note_event(event_type):
+    _debug["lastEventAt"] = int(time.time())
+    counts = _debug.setdefault("events", {})
+    counts[event_type] = counts.get(event_type, 0) + 1
+
+
+def _is_manual_override_active(agent_id, now=None):
+    now = now or time.time()
+    override = _manual_overrides.get(agent_id)
+    if override and override["expires"] > now:
+        return True
+    if override and override["expires"] <= now:
+        del _manual_overrides[agent_id]
+        with _state_lock:
+            if agent_id in _state and _state[agent_id].get("source") == "manual":
+                _state[agent_id]["source"] = "manual-expired"
+    return False
+
+
+def _ensure_agent(agent_id, source="discovered"):
+    if not agent_id:
+        return
+    with _state_lock:
+        if agent_id not in _state:
+            _state[agent_id] = {"state": "idle", "task": "", "updated": 0, "source": source}
+
+
+def _set_working(agent_id, task="Working", source="gateway-event", run_id=None):
+    if not agent_id or _is_manual_override_active(agent_id):
+        return
+    now = time.time()
+    _ensure_agent(agent_id)
+    _last_event_at[agent_id] = now
+    _last_event_task[agent_id] = task or "Working"
+    _finish_idle_at.pop(agent_id, None)
+    if run_id:
+        _run_agents[run_id] = agent_id
+    with _state_lock:
+        _state[agent_id].update({
+            "state": "working",
+            "task": task or "Working",
+            "updated": int(now),
+            "source": source,
+            **({"runId": run_id} if run_id else {})
+        })
+
+
+def _set_finishing(agent_id, source="gateway-lifecycle", run_id=None):
+    if not agent_id or _is_manual_override_active(agent_id):
+        return
+    now = time.time()
+    _ensure_agent(agent_id)
+    _last_event_at[agent_id] = now
+    _finish_idle_at[agent_id] = now + FINISHING_GRACE_SEC
+    with _state_lock:
+        current_task = _state.get(agent_id, {}).get("task") or _last_event_task.get(agent_id, "")
+        _state[agent_id].update({
+            "state": "finishing",
+            "task": current_task,
+            "updated": int(now),
+            "source": source,
+            **({"runId": run_id} if run_id else {})
+        })
+
+
+def _set_idle(agent_id, source="gateway-idle"):
+    if not agent_id or _is_manual_override_active(agent_id):
+        return
+    now = time.time()
+    _ensure_agent(agent_id)
+    _finish_idle_at.pop(agent_id, None)
+    with _state_lock:
+        _state[agent_id].update({
+            "state": "idle",
+            "task": "",
+            "updated": int(now),
+            "source": source
+        })
+
+
 def _format_tool_task(name, arguments):
     """Format a tool call into a human-readable task description."""
     args = arguments or {}
+    if not isinstance(args, dict):
+        args = {}
     if name == "exec":
         cmd = args.get("command", "")
         if "openclaw agent" in cmd:
@@ -172,9 +274,9 @@ def _format_tool_task(name, arguments):
             return "Working with Google"
         elif "curl" in cmd:
             return "Making HTTP request"
-        return f"Running command"
-    elif name == "sessions_send":
-        label = args.get("label", args.get("sessionKey", ""))
+        return "Running command"
+    elif name in ("sessions_send", "sessions_spawn"):
+        label = args.get("label", args.get("sessionKey", args.get("agentId", "")))
         return f"Messaging {label}" if label else "Messaging agent"
     elif name == "web_search":
         q = args.get("query", "")[:40]
@@ -183,11 +285,11 @@ def _format_tool_task(name, arguments):
         return "Fetching web page"
     elif name == "browser":
         return "Using browser"
-    elif name == "read" or name == "Read":
+    elif name in ("read", "Read"):
         return "Reading file"
-    elif name == "write" or name == "Write":
+    elif name in ("write", "Write"):
         return "Writing file"
-    elif name == "edit" or name == "Edit":
+    elif name in ("edit", "Edit"):
         return "Editing file"
     elif name == "memory_search":
         return "Searching memory"
@@ -197,154 +299,149 @@ def _format_tool_task(name, arguments):
         return "Analyzing image"
     elif name == "pdf":
         return "Analyzing PDF"
-    return f"Using {name}"
+    return f"Using {name}" if name else "Working"
+
+
+def _read_tool_name_and_args(data):
+    if not isinstance(data, dict):
+        return "", {}
+    name = (
+        data.get("name") or data.get("toolName") or data.get("tool") or
+        data.get("command") or data.get("function") or data.get("recipient_name") or ""
+    )
+    args = data.get("arguments") or data.get("args") or data.get("input") or data.get("params") or {}
+    # Some events carry a nested tool_call shape.
+    if not name and isinstance(data.get("toolCall"), dict):
+        tc = data.get("toolCall")
+        name = tc.get("name") or tc.get("toolName") or ""
+        args = tc.get("arguments") or tc.get("args") or args
+    return str(name), args if isinstance(args, dict) else {}
 
 
 def _process_event(event_type, payload):
-    """Process a gateway event and update presence state."""
-    session_key = payload.get("sessionKey", "")
-    agent_id = _extract_agent_id(session_key)
-    if not agent_id:
+    """Process a gateway event and update presence state.
+
+    Supports current OpenClaw event frames:
+      - agent: {runId, stream, sessionKey, data:{...}}
+      - session.tool/session.message/sessions.changed: session-scoped events
+      - presence: gateway/client/node presence, used only as a liveness signal
+    """
+    if not isinstance(payload, dict):
         return
+    _note_event(event_type)
 
-    now = time.time()
+    session_key = payload.get("sessionKey") or payload.get("key") or ""
+    agent_id = _extract_agent_id(session_key)
+    run_id = payload.get("runId") or payload.get("id")
+    if run_id and not agent_id:
+        agent_id = _run_agents.get(run_id)
 
-    # Check if manual override is active
-    override = _manual_overrides.get(agent_id)
-    if override and override["expires"] > now:
-        return  # Manual override still active, don't change state
+    # Some payloads nest useful fields under data.
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    if not agent_id:
+        agent_id = _extract_agent_id(data.get("sessionKey") or data.get("key") or "")
+    if run_id and agent_id:
+        _run_agents[run_id] = agent_id
 
-    # Clear expired overrides
-    if override and override["expires"] <= now:
-        del _manual_overrides[agent_id]
+    if event_type == "agent":
+        stream = str(payload.get("stream") or data.get("stream") or payload.get("type") or "")
+        phase = str(data.get("phase") or payload.get("phase") or "")
 
-    task = None
-
-    if event_type == "chat":
-        state_val = payload.get("state", "")
-        if state_val in ("delta", "streaming"):
-            task = "Responding..."
-            _last_event_at[agent_id] = now
-            _last_event_task[agent_id] = task
-        elif state_val in ("final", "done"):
-            # Turn complete — record recent activity, but don't force idle immediately.
-            # Let sessions polling + idle timeout decide when the agent is truly idle.
-            _last_event_at[agent_id] = now
-            _last_event_task[agent_id] = ""
+        if stream == "lifecycle" or phase:
+            if phase in ("start", "accepted", "running"):
+                _set_working(agent_id, "Working", "agent-lifecycle", run_id)
+            elif phase in ("end", "done", "final", "complete", "completed", "error", "aborted"):
+                _set_finishing(agent_id, "agent-lifecycle", run_id)
+            else:
+                _set_working(agent_id, "Working", "agent-lifecycle", run_id)
             return
 
-    elif event_type == "agent":
-        agent_type = payload.get("type", "")
-        if agent_type == "thinking":
-            task = "Thinking..."
-        elif agent_type == "tool_start":
-            name = payload.get("name", "")
-            arguments = payload.get("arguments", {})
-            task = _format_tool_task(name, arguments)
+        if stream in ("tool", "tool_start", "command_output", "approval", "plan", "patch", "item"):
+            name, args = _read_tool_name_and_args(data or payload)
+            task = _format_tool_task(name, args)
             if task is None:
-                return  # Skip office.py calls
-        elif agent_type == "tool_end" or agent_type == "tool_result":
-            task = "Processing..."
-        elif agent_type == "error":
-            task = None  # Will be handled by idle timeout
+                return
+            _set_working(agent_id, task, f"agent-{stream}", run_id)
+            return
 
-        if task is not None:
-            _last_event_at[agent_id] = now
-            _last_event_task[agent_id] = task
+        # Any other agent stream means the run is alive.
+        _set_working(agent_id, "Working", f"agent-{stream or 'event'}", run_id)
+        return
 
-    if task is not None:
-        with _state_lock:
-            if agent_id not in _state:
-                _state[agent_id] = {}
-            _state[agent_id].update({
-                "state": "working",
-                "task": task,
-                "updated": int(now),
-                "source": "gateway"
-            })
+    if event_type == "session.tool":
+        name, args = _read_tool_name_and_args(payload)
+        task = _format_tool_task(name, args)
+        if task is None:
+            return
+        _set_working(agent_id, task, "session-tool", run_id)
+        return
+
+    if event_type == "session.message":
+        role = payload.get("role") or data.get("role")
+        if role == "assistant":
+            _set_finishing(agent_id, "session-message", run_id)
+        elif role == "user":
+            _set_working(agent_id, "Responding", "session-message", run_id)
+        return
+
+    if event_type == "sessions.changed":
+        reason = str(payload.get("reason") or "")
+        if reason in ("run-started", "run_started", "created", "send", "message"):
+            _set_working(agent_id, "Active", "sessions-changed", run_id)
+        return
+
+    if event_type == "chat":
+        state_val = str(payload.get("state", ""))
+        if state_val in ("delta", "streaming"):
+            _set_working(agent_id, "Responding...", "chat", run_id)
+        elif state_val in ("final", "done"):
+            _set_finishing(agent_id, "chat", run_id)
 
 
 def _process_sessions_list(sessions):
-    """Process sessions.list response to detect activity changes."""
+    """Process a rare sessions.list snapshot for startup/reconnect recovery only."""
     now = time.time()
     now_ms = now * 1000
+    _debug["lastSnapshotAt"] = int(now)
+    _debug["snapshots"] = _debug.get("snapshots", 0) + 1
 
     for s in sessions:
         if not isinstance(s, dict):
             continue
         key = s.get("key", "")
-        if not key.startswith("agent:") or not key.endswith(":main"):
+        if not str(key).startswith("agent:"):
             continue
-
         agent_id = _extract_agent_id(key)
         if not agent_id:
             continue
-
-        updated_at = s.get("updatedAt", 0)
-        prev_updated = _last_updated_at.get(key, 0)
-
-        # Check if manual override is active
-        override = _manual_overrides.get(agent_id)
-        if override and override["expires"] > now:
-            _last_updated_at[key] = updated_at
-            continue
-
-        # Clear expired overrides and reset source
-        if override and override["expires"] <= now:
-            del _manual_overrides[agent_id]
-            with _state_lock:
-                if agent_id in _state and _state[agent_id].get("source") == "manual":
-                    _state[agent_id]["source"] = "manual-expired"
-
-        # Auto-register agents discovered from gateway
-        with _state_lock:
-            if agent_id not in _state:
-                _state[agent_id] = {"state": "idle", "task": "", "updated": 0, "source": "discovered"}
-
-        session_is_fresh = updated_at and ((now_ms - updated_at) / 1000) < IDLE_TIMEOUT_SEC
-        session_changed = updated_at > prev_updated
-
-        if session_is_fresh and (session_changed or prev_updated == 0):
-            # Session is active right now — mark working even on first sight.
-            # This lets polling recover if the WS event stream missed activity.
-            last_evt = _last_event_at.get(agent_id, 0)
-            if now - last_evt > 5:
-                # No recent real-time event, use sessions.list detection
-                with _state_lock:
-                    current = _state[agent_id].get("state", "idle")
-                    current_task = _state[agent_id].get("task", "")
-                    if current != "working" or not current_task:
-                        _state[agent_id].update({
-                            "state": "working",
-                            "task": current_task or "Active",
-                            "updated": int(now),
-                            "source": "gateway-poll"
-                        })
-
+        _ensure_agent(agent_id, "snapshot")
+        updated_at = s.get("updatedAt", 0) or s.get("lastMessageAt", 0) or 0
         _last_updated_at[key] = updated_at
+        if updated_at and ((now_ms - updated_at) / 1000) < IDLE_TIMEOUT_SEC:
+            _set_working(agent_id, _last_event_task.get(agent_id) or "Recently active", "snapshot")
 
-        # Check for idle timeout
-        last_activity = max(
-            updated_at / 1000,
-            _last_event_at.get(agent_id, 0)
-        )
-        idle_for = now - last_activity
 
-        if idle_for > IDLE_TIMEOUT_SEC:
+def _maintenance_tick():
+    """Expire finishing/working states without calling OpenClaw."""
+    now = time.time()
+    _sync_meetings_from_file()
+
+    # Expire manual overrides.
+    for agent_id in list(_manual_overrides.keys()):
+        _is_manual_override_active(agent_id, now)
+
+    # finishing -> idle after grace.
+    for agent_id, idle_at in list(_finish_idle_at.items()):
+        if now >= idle_at:
+            _set_idle(agent_id, "finish-grace-expired")
+
+    # working -> idle after no event activity.
+    for agent_id, last_at in list(_last_event_at.items()):
+        if now - last_at > IDLE_TIMEOUT_SEC:
             with _state_lock:
-                current_state = _state[agent_id].get("state", "idle")
-                current_source = _state[agent_id].get("source", "")
-                # Only skip if there's an ACTIVE (non-expired) manual override
-                has_active_override = (agent_id in _manual_overrides and
-                    _manual_overrides[agent_id]["expires"] > now)
-                if current_state == "working" and not has_active_override:
-                    _state[agent_id].update({
-                        "state": "idle",
-                        "task": "",
-                        "updated": int(now),
-                        "source": "gateway-idle"
-                    })
-
+                current = _state.get(agent_id, {}).get("state")
+            if current in ("working", "finishing"):
+                _set_idle(agent_id, "event-idle-timeout")
 
 # ─── Meeting File Sync ────────────────────────────────────────────
 
@@ -452,15 +549,15 @@ async def _gateway_loop(gateway_url, gateway_token, origin):
                 # Successful connection — reset failure counter
                 _consecutive_failures = 0
                 _gw_connected = True
+                _debug["connectedAt"] = int(time.time())
                 print("✅ Gateway presence: connected")
 
-                # Single-reader loop + poller + ping
-                # Use an asyncio.Queue to pass responses from reader to poller
-                response_queue = asyncio.Queue()
+                # Subscribe once; after this, presence is event-driven.
+                await _send_subscriptions_and_snapshot(ws)
 
                 await asyncio.gather(
-                    _message_reader(ws, response_queue),
-                    _sessions_poller(ws, response_queue),
+                    _message_reader(ws),
+                    _maintenance_loop(),
                     _ping_loop(ws),
                 )
 
@@ -491,8 +588,26 @@ async def _gateway_loop(gateway_url, gateway_token, origin):
             await asyncio.sleep(sleep_sec)
 
 
-async def _message_reader(ws, response_queue):
-    """Single reader: reads all WS messages, dispatches events, routes responses."""
+async def _send_subscriptions_and_snapshot(ws):
+    """Subscribe to incremental events and request one bounded startup snapshot."""
+    reqs = [
+        {"type": "req", "id": "gp-sub-sessions", "method": "sessions.subscribe", "params": {}},
+        {"type": "req", "id": "gp-presence", "method": "system-presence", "params": {}},
+        {
+            "type": "req",
+            "id": "gp-snapshot-1",
+            "method": "sessions.list",
+            "params": {"limit": SESSIONS_BOOTSTRAP_LIMIT},
+        },
+    ]
+    for req in reqs:
+        if req["method"] == "sessions.list":
+            _debug["sessionListCalls"] = _debug.get("sessionListCalls", 0) + 1
+        await ws.send(json.dumps(req))
+
+
+async def _message_reader(ws):
+    """Single reader: reads all WS messages and dispatches events/responses."""
     global _gw_connected
     try:
         async for raw in ws:
@@ -506,13 +621,17 @@ async def _message_reader(ws, response_queue):
             if msg_type == "event":
                 event = msg.get("event", "")
                 payload = msg.get("payload", {})
-                if event in ("chat", "agent"):
+                if event in ("chat", "agent", "session.message", "session.tool", "sessions.changed", "presence"):
                     _process_event(event, payload)
-                # Ignore health, tick, presence
 
             elif msg_type == "res":
-                # Route response to poller
-                await response_queue.put(msg)
+                req_id = str(msg.get("id") or "")
+                if req_id.startswith("gp-snapshot") and msg.get("ok"):
+                    payload = msg.get("payload") or {}
+                    sessions = payload.get("sessions", []) if isinstance(payload, dict) else []
+                    _process_sessions_list(sessions)
+                elif req_id == "gp-presence" and msg.get("ok"):
+                    _debug["lastSnapshotAt"] = int(time.time())
 
     except websockets.exceptions.ConnectionClosed:
         _gw_connected = False
@@ -522,46 +641,11 @@ async def _message_reader(ws, response_queue):
         print(f"⚠️  Gateway presence: reader error: {e}")
 
 
-async def _sessions_poller(ws, response_queue):
-    """Periodically send sessions.list requests and process responses."""
-    req_counter = 0
+async def _maintenance_loop():
+    """Local state maintenance. No gateway polling here."""
     while True:
-        try:
-            await asyncio.sleep(SESSIONS_POLL_SEC)
-            req_counter += 1
-            req_id = f"gp-sl-{req_counter}"
-
-            req = {
-                "type": "req",
-                "id": req_id,
-                "method": "sessions.list",
-                "params": {}
-            }
-            await ws.send(json.dumps(req))
-
-            # Wait for our response from the queue
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                try:
-                    remaining = max(0.1, deadline - time.time())
-                    msg = await asyncio.wait_for(response_queue.get(), timeout=remaining)
-
-                    if msg.get("id") == req_id:
-                        if msg.get("ok"):
-                            sessions = msg.get("payload", {}).get("sessions", [])
-                            _process_sessions_list(sessions)
-                        # Sync meetings from file on each poll cycle
-                        _sync_meetings_from_file()
-                        break
-                    # Not our response — discard (could be from another request)
-                except asyncio.TimeoutError:
-                    break
-
-        except websockets.exceptions.ConnectionClosed:
-            break
-        except Exception as e:
-            print(f"⚠️  Gateway presence: poll error: {e}")
-            await asyncio.sleep(5)
+        _maintenance_tick()
+        await asyncio.sleep(2)
 
 
 async def _ping_loop(ws):

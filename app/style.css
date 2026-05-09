@@ -1973,6 +1973,20 @@ button:active { transform: translateY(3px); box-shadow: none; }
     line-height: 1.5;
     word-break: break-word;
 }
+.chat-sender-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    opacity: 0.82;
+    margin-bottom: 4px;
+    text-transform: none;
+}
+.chat-sender-label.agent {
+    color: #ffd54f;
+}
+.chat-sender-label.human {
+    color: rgba(255,255,255,0.82);
+}
 .chat-msg.user .chat-bubble {
     background: linear-gradient(135deg, #1976d2, #1565c0);
     color: #fff;
@@ -1990,6 +2004,60 @@ button:active { transform: translateY(3px); box-shadow: none; }
     font-size: 11px;
     padding: 4px 10px;
     border-radius: 8px;
+}
+
+.chat-tool-msg { justify-content: flex-start; }
+.chat-tool-call {
+    max-width: 85%;
+    width: 85%;
+    margin: 2px 0;
+    border: 1px solid rgba(255,215,0,0.22);
+    border-radius: 10px;
+    background: rgba(255,255,255,0.055);
+    color: var(--ui-text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    overflow: hidden;
+}
+.chat-tool-call.running { border-color: rgba(255,215,0,0.42); box-shadow: 0 0 0 1px rgba(255,215,0,0.06) inset; }
+.chat-tool-call.done { border-color: rgba(76,175,80,0.34); }
+.chat-tool-call.error { border-color: rgba(244,67,54,0.48); }
+.chat-tool-summary {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px;
+    cursor: pointer;
+    list-style: none;
+    font-size: 12px;
+}
+.chat-tool-summary::-webkit-details-marker { display: none; }
+.chat-tool-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-tool-state {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    opacity: 0.75;
+    padding: 2px 5px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+}
+.chat-tool-call.running .chat-tool-state { color: #ffd54f; }
+.chat-tool-call.done .chat-tool-state { color: #81c784; }
+.chat-tool-call.error .chat-tool-state { color: #ef9a9a; }
+.chat-tool-body { border-top: 1px solid rgba(255,255,255,0.08); padding: 8px 10px 10px; }
+.chat-tool-section + .chat-tool-section { margin-top: 8px; }
+.chat-tool-section-label { font-size: 10px; opacity: 0.65; margin-bottom: 3px; font-weight: 700; }
+.chat-tool-section pre {
+    margin: 0;
+    max-height: 220px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: rgba(0,0,0,0.28);
+    border-radius: 6px;
+    padding: 7px;
+    font-size: 11px;
+    line-height: 1.35;
 }
 
 .chat-bubble a {

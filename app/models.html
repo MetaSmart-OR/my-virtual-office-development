@@ -140,6 +140,7 @@
                 <select id="new-prov-api">
                     <option value="openai-completions">openai-completions</option>
                     <option value="openai-responses">openai-responses</option>
+                    <option value="ollama">ollama</option>
                 </select>
             </div>
             <button class="btn btn-gold" onclick="addCustomProvider()">Add Provider</button>
@@ -307,7 +308,7 @@ function renderOllama() {
     let html = `<div class="card">
         <div class="provider-header">
             <span class="provider-name">🦙 OLLAMA</span>
-            <span style="font-size:6px;color:var(--text-dim)">${ollama.baseUrl}</span>
+            <span style="font-size:6px;color:var(--text-dim)">${ollama.baseUrl} · api: ${ollama.api || 'ollama'} · key: ${ollama.apiKeyConfigured ? 'set' : 'missing'} · timeout: ${ollama.timeoutSeconds || 300}s</span>
         </div>
     </div>`;
 
@@ -353,6 +354,10 @@ function renderOllama() {
 // --- API Actions ---
 function normalizeProvider(provider) {
     return provider.replace(/-token$|(-oauth)$/,'');
+}
+
+function normalizeOllamaBaseUrl(url) {
+    return (url || '').trim().replace(/\/v1\/?$/, '');
 }
 
 async function saveKey(provider) {
@@ -450,7 +455,7 @@ async function saveOllamaModel(modelId) {
     try {
         const res = await fetch('/config/providers/save-custom', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ provider: 'ollama', baseUrl: ollama.baseUrl, models })
+            body: JSON.stringify({ provider: 'ollama', baseUrl: normalizeOllamaBaseUrl(ollama.baseUrl), api: 'ollama', apiKey: 'ollama-tailscale-local', timeoutSeconds: ollama.timeoutSeconds || 300, models })
         });
         const data = await res.json();
         if (data.ok) {
@@ -471,7 +476,7 @@ async function removeOllamaModel(modelId) {
     try {
         const res = await fetch('/config/providers/save-custom', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ provider: 'ollama', baseUrl: ollama.baseUrl, models })
+            body: JSON.stringify({ provider: 'ollama', baseUrl: normalizeOllamaBaseUrl(ollama.baseUrl), api: 'ollama', apiKey: 'ollama-tailscale-local', timeoutSeconds: ollama.timeoutSeconds || 300, models })
         });
         const data = await res.json();
         if (data.ok) {
@@ -497,7 +502,7 @@ async function addOllamaModel() {
     try {
         const res = await fetch('/config/providers/save-custom', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ provider: 'ollama', baseUrl: ollama.baseUrl, models })
+            body: JSON.stringify({ provider: 'ollama', baseUrl: normalizeOllamaBaseUrl(ollama.baseUrl), api: 'ollama', apiKey: 'ollama-tailscale-local', timeoutSeconds: ollama.timeoutSeconds || 300, models })
         });
         const data = await res.json();
         if (data.ok) {
@@ -529,7 +534,7 @@ function renderLMStudio() {
     let html = `<div class="card">
         <div class="provider-header">
             <span class="provider-name">🖥️ LM STUDIO</span>
-            <span style="font-size:6px;color:var(--text-dim)">${lms.baseUrl}</span>
+            <span style="font-size:6px;color:var(--text-dim)">${lms.baseUrl} · api: ${lms.api || 'openai-completions'} · key: ${lms.apiKeyConfigured ? 'set' : 'missing'} · timeout: ${lms.timeoutSeconds || 300}s</span>
         </div>
     </div>`;
 
@@ -594,7 +599,7 @@ async function saveLMStudioModel(modelId) {
     try {
         const res = await fetch('/config/providers/save-custom', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ provider: 'lmstudio', baseUrl: lms.baseUrl, models })
+            body: JSON.stringify({ provider: 'lmstudio', baseUrl: lms.baseUrl, api: 'openai-completions', timeoutSeconds: lms.timeoutSeconds || 300, models })
         });
         const data = await res.json();
         if (data.ok) {
@@ -615,7 +620,7 @@ async function removeLMStudioModel(modelId) {
     try {
         const res = await fetch('/config/providers/save-custom', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ provider: 'lmstudio', baseUrl: lms.baseUrl, models })
+            body: JSON.stringify({ provider: 'lmstudio', baseUrl: lms.baseUrl, api: 'openai-completions', timeoutSeconds: lms.timeoutSeconds || 300, models })
         });
         const data = await res.json();
         if (data.ok) {
@@ -641,7 +646,7 @@ async function addLMStudioModel() {
     try {
         const res = await fetch('/config/providers/save-custom', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ provider: 'lmstudio', baseUrl: lms.baseUrl, models })
+            body: JSON.stringify({ provider: 'lmstudio', baseUrl: lms.baseUrl, api: 'openai-completions', timeoutSeconds: lms.timeoutSeconds || 300, models })
         });
         const data = await res.json();
         if (data.ok) {

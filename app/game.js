@@ -7272,7 +7272,11 @@ function pollAgentChat() {
                 } else if (msg.time) {
                     timeTag = '[' + msg.time + '] ';
                 }
-                var prefix = timeTag + (isUser ? (msg.from ? msg.from + ': ' : 'IN: ') : '');
+                var senderLabel = '';
+                if (isUser && msg.from) {
+                    senderLabel = msg.to ? (msg.from + ' → ' + msg.to) : msg.from;
+                }
+                var prefix = timeTag + (isUser ? (senderLabel ? senderLabel + ': ' : 'IN: ') : '');
                 if (mi < msgs.length - 1) {
                     // Non-last messages: pre-wrap now (they never change)
                     var displayText = msg.text;

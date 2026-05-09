@@ -266,6 +266,50 @@ def refresh_agent_maps():
     AGENT_WORKSPACES = _build_agent_workspaces()
     AGENT_SESSION_IDS = _build_agent_session_ids()
 
+
+def _agent_display_label(agent_id_or_key):
+    """Return a friendly VO label for an agent id/status key without exposing internals."""
+    if not agent_id_or_key:
+        return ""
+    needle = str(agent_id_or_key)
+    for a in get_roster():
+        if needle in (a.get("id"), a.get("statusKey")):
+            name = a.get("name") or needle
+            emoji = a.get("emoji") or ""
+            return f"{name} {emoji}".strip()
+    return needle
+
+
+def _agent_id_from_session_key(session_key):
+    """Parse OpenClaw session keys like agent:<agentId>:<bucket>."""
+    if not session_key:
+        return ""
+    m = re.match(r"^agent:([^:]+):", str(session_key))
+    return m.group(1) if m else ""
+
+
+def _parse_a2a_envelope(text):
+    """Parse the lightweight VO A2A display envelope, if present.
+
+    This is display metadata only. Agent trust/authority still comes from
+    OpenClaw provenance or the sender wrapper, never from arbitrary text alone.
+    Supported form:
+      [A2A from=elix name="Elix ⚡" to=pq-m-moe isUser=false]
+    """
+    if not text:
+        return None, text
+    m = re.match(r"^\s*\[A2A\s+([^\]]+)\]\s*\n?", text)
+    if not m:
+        return None, text
+    attrs = {}
+    raw = m.group(1)
+    for km in re.finditer(r"([A-Za-z][\w-]*)=(\"[^\"]*\"|'[^']*'|\S+)", raw):
+        val = km.group(2).strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        attrs[km.group(1)] = val
+    return attrs, text[m.end():].lstrip()
+
 ##############################################################################
 # AGENT CREATION + SKILLS MANAGEMENT
 ##############################################################################
@@ -3823,15 +3867,38 @@ def get_agent_messages(agent_key, max_messages=500):
                         _add_media_url(_path, _mime, os.path.basename(_path))
                 if not text and not media:
                     continue
+
+                # Sender attribution for agent-to-agent / inter-session turns.
+                # OpenClaw keeps role='user' for provider compatibility, so VO
+                # needs provenance/display metadata to avoid showing agent input
+                # as a generic human "IN:" message.
                 from_agent = ""
-                prov = msg.get("provenance", {})
-                if role == "user" and prov:
+                from_agent_id = ""
+                to_agent = _agent_display_label(agent_id)
+                to_agent_id = agent_id
+                is_inter_session = False
+                provenance_kind = ""
+                prov = msg.get("provenance", {}) if isinstance(msg.get("provenance", {}), dict) else {}
+                if role == "user" and prov.get("kind") == "inter_session":
+                    provenance_kind = "inter_session"
+                    is_inter_session = True
                     source = prov.get("sourceSessionKey", "")
-                    # Match source session key to any discovered agent
-                    for _da in get_roster():
-                        if _da["id"] in source or _da["statusKey"] in source:
-                            from_agent = _da["name"].lower()
-                            break
+                    from_agent_id = _agent_id_from_session_key(source)
+                    from_agent = _agent_display_label(from_agent_id) if from_agent_id else "Agent"
+
+                a2a_meta, clean_text = _parse_a2a_envelope(text)
+                if a2a_meta:
+                    text = clean_text
+                    is_inter_session = True
+                    from_agent_id = a2a_meta.get("from") or from_agent_id
+                    if a2a_meta.get("name"):
+                        from_agent = a2a_meta.get("name")
+                    elif from_agent_id:
+                        from_agent = _agent_display_label(from_agent_id)
+                    if a2a_meta.get("to"):
+                        to_agent_id = a2a_meta.get("to")
+                        to_agent = _agent_display_label(to_agent_id)
+
                 # Send raw epoch ms to client — browser converts to local timezone
                 epoch_ms = 0
                 if ts:
@@ -3840,7 +3907,19 @@ def get_agent_messages(agent_key, max_messages=500):
                         epoch_ms = int(dt.timestamp() * 1000)
                     except Exception:
                         pass
-                messages.append({"role": role, "text": text[:500], "ts": ts, "epochMs": epoch_ms, "from": from_agent, "media": media[:4]})
+                messages.append({
+                    "role": role,
+                    "text": text[:500],
+                    "ts": ts,
+                    "epochMs": epoch_ms,
+                    "from": from_agent,
+                    "fromAgentId": from_agent_id,
+                    "to": to_agent,
+                    "toAgentId": to_agent_id,
+                    "isInterSession": is_inter_session,
+                    "provenanceKind": provenance_kind,
+                    "media": media[:4],
+                })
     except Exception as e:
         return []
     return messages[-max_messages:]
@@ -4792,6 +4871,8 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             # Presence API — read from gateway_presence in-memory state
             if self.path == "/api/presence":
                 result = gateway_presence.get_state()
+            elif self.path == "/api/presence/debug":
+                result = gateway_presence.get_connection_status()
             else:
                 agent_id = self.path.split("/api/presence/")[1].strip("/")
                 result = gateway_presence.get_agent_state(agent_id)
@@ -5492,6 +5573,8 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             custom_providers[prov_name] = {
                 "baseUrl": prov_data.get("baseUrl", ""),
                 "api": prov_data.get("api", ""),
+                "apiKeyConfigured": bool(prov_data.get("apiKey")),
+                "timeoutSeconds": prov_data.get("timeoutSeconds"),
                 "models": [{"id": m["id"], "name": m.get("name", m["id"]),
                             "contextWindow": m.get("contextWindow", 0),
                             "maxTokens": m.get("maxTokens", 0)}
@@ -5530,7 +5613,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         }
         return self._send_watcher_request(request)
 
-    def _save_custom_provider(self, provider, base_url, models, params=None):
+    def _save_custom_provider(self, provider, base_url, models, params=None, api=None, api_key=None, timeout_seconds=None):
         """Save a custom provider config."""
         request = {
             "type": "save-custom-provider",
@@ -5538,6 +5621,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             "baseUrl": base_url,
             "models": models,
         }
+        if api:
+            request["api"] = api
+        if api_key:
+            request["apiKey"] = api_key
+        if timeout_seconds:
+            request["timeoutSeconds"] = timeout_seconds
         if params:
             request["params"] = params
         return self._send_watcher_request(request)
@@ -5692,9 +5781,26 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
         cfg.setdefault("models", {}).setdefault("providers", {})
         existing = cfg["models"]["providers"].get(provider, {})
+
+        requested_api = req.get("api")
+        requested_api_key = req.get("apiKey")
+        requested_timeout = req.get("timeoutSeconds")
+        if provider == "ollama":
+            # OpenClaw 2026.5.x expects the native Ollama API root, not /v1.
+            base_url = re.sub(r"/v1/?$", "", (base_url or "").strip())
+            requested_api = requested_api or "ollama"
+            requested_api_key = requested_api_key or existing.get("apiKey") or "ollama-tailscale-local"
+            requested_timeout = requested_timeout or existing.get("timeoutSeconds") or 300
+
         existing["baseUrl"] = base_url
-        if not existing.get("api"):
+        if requested_api:
+            existing["api"] = requested_api
+        elif not existing.get("api"):
             existing["api"] = "openai-completions"
+        if requested_api_key:
+            existing["apiKey"] = requested_api_key
+        if requested_timeout:
+            existing["timeoutSeconds"] = int(requested_timeout)
 
         old_models = {m["id"]: m for m in existing.get("models", [])}
         new_models = []
@@ -6349,7 +6455,15 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path == "/config/providers/save-custom":
             length = int(self.headers.get('Content-Length', 0))
             body = json.loads(self.rfile.read(length)) if length else {}
-            result = self._save_custom_provider(body.get("provider", ""), body.get("baseUrl", ""), body.get("models", []), body.get("params"))
+            result = self._save_custom_provider(
+                body.get("provider", ""),
+                body.get("baseUrl", ""),
+                body.get("models", []),
+                body.get("params"),
+                body.get("api"),
+                body.get("apiKey"),
+                body.get("timeoutSeconds"),
+            )
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
