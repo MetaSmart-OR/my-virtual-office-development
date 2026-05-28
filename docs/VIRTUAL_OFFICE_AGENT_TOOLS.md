@@ -31,6 +31,16 @@ The raw cross-platform communication skill is also exposed at:
 
 ## Tool surfaces
 
+### Agent platforms
+
+Use when the office needs to create or remove agents on a connected platform.
+
+- `GET /api/agent-platforms`
+- `POST /api/agent/create`
+- `DELETE /api/agent/delete`
+
+`POST /api/agent/create` accepts `platform: "openclaw"` or `platform: "hermes"`. OpenClaw creation goes through Gateway `agents.create` / `agents.files.set` so the agent is runnable immediately and files are owned by the OpenClaw user. Hermes creation maps one office agent to one Hermes profile and uses `hermes profile create/delete`.
+
 ### AgentPlatform-to-AgentPlatform Communications
 
 Use when agents need to talk across providers and the exchange should be visible in Virtual Office.

@@ -17,11 +17,15 @@ The adapter exposes:
 - `discover_agents()` — returns Hermes profiles as normalized office agents
 - `test()` — checks the configured Hermes CLI/home and returns detected profiles
 - `send_message(profile, message)` — sends a one-shot Hermes message through the public CLI and returns stdout
+- `create_agent(name, role, model, emoji, profile)` — creates a Hermes profile for a Virtual Office agent
+- `delete_agent(profile)` — deletes a Hermes profile through the public CLI
 
 It uses safe public Hermes surfaces only:
 
 - `hermes profile list`
 - `hermes profile show <profile>`
+- `hermes profile create <profile> --clone --clone-from default --no-alias --description <role>`
+- `hermes profile delete <profile> --yes`
 - `hermes -z <message>`
 - `hermes --profile <profile> -z <message>` for named profiles
 
@@ -63,6 +67,8 @@ Example:
 - `/api/hermes/chat`
 - `/api/hermes/history`
 - `/api/hermes/history/clear`
+- `/api/agent/create` with `platform: "hermes"`
+- `/api/agent/delete` for `hermes-<profile>` agents
 
 OpenClaw discovery, chat, model info, skills, transcripts, and gateway paths are intentionally kept unchanged for now.
 

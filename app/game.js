@@ -12519,25 +12519,51 @@ function _isCustomAgent(agentId) {
 }
 
 function _acpCreateNewAgent() {
-    var agentName = prompt('Agent name:', 'New Agent');
-    if (!agentName || !agentName.trim()) return;
-    agentName = agentName.trim();
+    fetch('/api/agent-platforms').then(function(res) {
+        return res.json();
+    }).catch(function() {
+        return { platforms: [{ id: 'openclaw', label: 'OpenClaw', available: true }] };
+    }).then(function(platformData) {
+        var platforms = (platformData.platforms || []).filter(function(p){ return p.available && p.create; });
+        if (!platforms.length) {
+            alert('No agent platforms are available.');
+            return null;
+        }
+        var platformPrompt = 'Agent Platform:\n' + platforms.map(function(p, i){
+            return (i + 1) + '. ' + p.label;
+        }).join('\n');
+        var platformChoice = prompt(platformPrompt, platforms[0].label);
+        if (platformChoice === null) return null;
+        platformChoice = platformChoice.trim().toLowerCase();
+        var selectedPlatform = platforms.find(function(p, i){
+            return platformChoice === p.id.toLowerCase() ||
+                   platformChoice === p.label.toLowerCase() ||
+                   platformChoice === String(i + 1);
+        }) || platforms[0];
 
-    var agentRole = prompt('Role (e.g., "Email specialist", "QA engineer"):', 'AI assistant');
-    if (agentRole === null) return;
-    agentRole = agentRole.trim() || 'AI assistant';
+        var agentName = prompt('Agent name:', 'New Agent');
+        if (!agentName || !agentName.trim()) return null;
+        agentName = agentName.trim();
 
-    var agentEmoji = prompt('Emoji:', '🤖');
-    if (agentEmoji === null) return;
-    agentEmoji = agentEmoji.trim() || '🤖';
+        var agentRole = prompt('Role (e.g., "Email specialist", "QA engineer"):', selectedPlatform.id === 'hermes' ? 'Hermes Agent' : 'AI assistant');
+        if (agentRole === null) return null;
+        agentRole = agentRole.trim() || (selectedPlatform.id === 'hermes' ? 'Hermes Agent' : 'AI assistant');
 
-    // Call server to create the OpenClaw agent
-    _acpShowToast('Creating agent in OpenClaw...');
-    fetch('/api/agent/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: agentName, role: agentRole, emoji: agentEmoji })
-    }).then(function(res) { return res.json(); }).then(function(data) {
+        var agentEmoji = prompt('Emoji:', selectedPlatform.id === 'hermes' ? '⚕️' : '🤖');
+        if (agentEmoji === null) return null;
+        agentEmoji = agentEmoji.trim() || (selectedPlatform.id === 'hermes' ? '⚕️' : '🤖');
+
+        _acpShowToast('Creating agent in ' + selectedPlatform.label + '...');
+        return fetch('/api/agent/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ platform: selectedPlatform.id, name: agentName, role: agentRole, emoji: agentEmoji })
+        }).then(function(res) { return res.json(); }).then(function(data) {
+            return { data: data, platform: selectedPlatform, name: agentName, role: agentRole, emoji: agentEmoji };
+        });
+    }).then(function(result) {
+        if (!result) return;
+        var data = result.data;
         if (data.error) {
             alert('Failed to create agent: ' + data.error);
             return;
@@ -12545,12 +12571,14 @@ function _acpCreateNewAgent() {
         var newId = data.agentId;
         var newAgent = {
             id: newId,
-            name: agentName,
-            role: agentRole,
-            emoji: agentEmoji,
+            name: result.name,
+            role: result.role,
+            emoji: result.emoji,
             gender: 'M',
             color: '#607d8b',
             statusKey: newId,
+            providerKind: data.providerKind || result.platform.id || 'openclaw',
+            providerAgentId: data.providerAgentId || data.profile || newId,
             branch: 'UNASSIGNED',
             deskType: 'center',
         };
@@ -12573,7 +12601,7 @@ function _acpCreateNewAgent() {
         saveOfficeConfig();
         _acpRefreshList();
         _acpSelectAgent(newId);
-        _acpShowToast('✅ Agent "' + agentName + '" created in OpenClaw!');
+        _acpShowToast('✅ Agent "' + result.name + '" created in ' + result.platform.label + '!');
     }).catch(function(e) {
         alert('Error creating agent: ' + e.message);
     });
@@ -12584,9 +12612,10 @@ function _acpDeleteAgent(agentId) {
     var agentCfg = (officeConfig.agents || []).find(function(a) { return a.id === agentId; });
     if (agentCfg) agentName = agentCfg.name || agentId;
 
-    if (!confirm('Delete agent "' + agentName + '"?\n\nThis will permanently remove the agent from OpenClaw, including all workspace files, memory, and session history.\n\nThis cannot be undone.')) return;
+    var providerKind = (agentCfg && agentCfg.providerKind) || (agentId.indexOf('hermes-') === 0 ? 'hermes' : 'OpenClaw');
+    if (!confirm('Delete agent "' + agentName + '"?\n\nThis will permanently remove the agent from ' + providerKind + ', including its workspace/profile files, memory, and session history.\n\nThis cannot be undone.')) return;
 
-    // Call server to delete from OpenClaw
+    // Call server to delete from the backing agent platform.
     fetch('/api/agent/delete', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },

@@ -894,6 +894,37 @@ def _handle_hermes_test(body=None):
     hermes_home = os.path.expanduser(body.get("homePath") or hermes_cfg.get("homePath") or "~/.hermes")
     return HermesProvider(home_path=hermes_home, binary=hermes_bin, enabled=True).test()
 
+def _handle_agent_platforms():
+    """Return agent platforms available to the New Agent workflow."""
+    hermes_cfg = VO_CONFIG.get("hermes", {})
+    hermes_status = HermesProvider(
+        home_path=hermes_cfg.get("homePath"),
+        binary=hermes_cfg.get("binary"),
+        enabled=hermes_cfg.get("enabled", True),
+    ).test()
+    return {
+        "ok": True,
+        "platforms": [
+            {
+                "id": "openclaw",
+                "label": "OpenClaw",
+                "description": "Native OpenClaw workspace agent",
+                "available": True,
+                "create": True,
+                "delete": True,
+            },
+            {
+                "id": "hermes",
+                "label": "Hermes",
+                "description": "Hermes profile-backed agent",
+                "available": bool(hermes_status.get("ok")),
+                "create": bool(hermes_status.get("ok")),
+                "delete": bool(hermes_status.get("ok")),
+                "error": "" if hermes_status.get("ok") else hermes_status.get("error", "Hermes is not available"),
+            },
+        ],
+    }
+
 
 # ─── AGENT PLATFORM COMMUNICATION LAYER ─────────────────────────
 
@@ -1234,132 +1265,207 @@ def _sanitize_agent_id(name):
     s = re.sub(r'-+', '-', s).strip('-')
     return s or f"agent-{int(time.time())}"
 
-def _handle_agent_create(body):
-    """Create a new OpenClaw agent from the VO app."""
-    name = (body.get("name") or "").strip()
-    if not name:
-        return {"error": "Agent name is required", "_status": 400}
+def _remove_openclaw_agent_paths(agent_id):
+    """Remove local OpenClaw agent/workspace leftovers after Gateway deletion."""
+    safe_id = _sanitize_agent_id(agent_id)
+    if safe_id != agent_id:
+        raise ValueError("Unsafe agent ID")
 
-    agent_id = body.get("id") or _sanitize_agent_id(name)
-    emoji = body.get("emoji", "🤖")
-    role = body.get("role", "AI assistant")
-    model = body.get("model", "")
-
-    # Check if agent already exists
-    agent_dir = os.path.join(WORKSPACE_BASE, f"agents/{agent_id}")
-    if os.path.exists(agent_dir):
-        return {"error": f"Agent '{agent_id}' already exists", "_status": 409}
-
-    workspace_dir = os.path.join(WORKSPACE_BASE, f"workspace-{agent_id}")
-
-    try:
-        # 1. Create agent directory structure
-        os.makedirs(os.path.join(agent_dir, "sessions"), exist_ok=True)
-        # Write empty agent marker
-        with open(os.path.join(agent_dir, "agent"), "w") as f:
+    base = os.path.realpath(WORKSPACE_BASE)
+    targets = [
+        os.path.join(base, "agents", safe_id),
+        os.path.join(base, f"workspace-{safe_id}"),
+    ]
+    for target in targets:
+        real_target = os.path.realpath(target)
+        if not (real_target == base or real_target.startswith(base + os.sep)):
+            raise ValueError(f"Refusing to remove path outside OpenClaw home: {target}")
+        try:
+            if os.path.islink(target) or os.path.isfile(target):
+                os.remove(target)
+            elif os.path.isdir(target):
+                shutil.rmtree(target)
+        except FileNotFoundError:
             pass
-        # Write empty sessions.json
-        with open(os.path.join(agent_dir, "sessions", "sessions.json"), "w") as f:
-            json.dump({}, f)
-        # Write MEMORY.md in agent dir
-        with open(os.path.join(agent_dir, "MEMORY.md"), "w") as f:
-            f.write(f"# MEMORY.md - {name}\n\n_No memories yet._\n")
 
-        # 2. Create workspace with template files
-        os.makedirs(os.path.join(workspace_dir, "memory"), exist_ok=True)
-        os.makedirs(os.path.join(workspace_dir, "skills"), exist_ok=True)
+def _run_async_blocking(coro, timeout=30):
+    """Run an async Gateway helper from either sync or async server code."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, coro)
+        return future.result(timeout=timeout)
 
-        _write_template(workspace_dir, "IDENTITY.md", f"""# IDENTITY.md
+async def _gateway_rpc_call_async(method, params=None, timeout=20):
+    """Call an OpenClaw Gateway RPC as the Virtual Office server."""
+    token = _get_gateway_token()
+    if not token:
+        return {"ok": False, "error": "Gateway token is not configured"}
+    gw_url = VO_CONFIG.get("openclaw", {}).get("gatewayUrl", "ws://127.0.0.1:18789")
+    origin = f"http://127.0.0.1:{PORT}"
+    async with ws_connect(
+        gw_url,
+        max_size=1024 * 1024,
+        additional_headers={"Origin": origin},
+        close_timeout=3,
+    ) as ws:
+        await asyncio.wait_for(ws.recv(), timeout=5)
+        connect_id = f"vo-agent-admin-connect-{uuid.uuid4()}"
+        await ws.send(json.dumps({
+            "type": "req",
+            "id": connect_id,
+            "method": "connect",
+            "params": {
+                "minProtocol": 4,
+                "maxProtocol": 4,
+                "client": {"id": "openclaw-control-ui", "version": "2026.5.27", "platform": "server", "mode": "webchat"},
+                "role": "operator",
+                "scopes": ["operator.read", "operator.write", "operator.admin"],
+                "caps": [],
+                "commands": [],
+                "permissions": {},
+                "auth": {"token": token},
+                "locale": "en-US",
+                "userAgent": "virtual-office-server/agent-admin",
+            },
+        }))
+        while True:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            if msg.get("id") == connect_id:
+                if not msg.get("ok"):
+                    return {"ok": False, "error": msg.get("error", {}).get("message", "Gateway connect failed")}
+                break
+
+        req_id = f"vo-agent-admin-{uuid.uuid4()}"
+        await ws.send(json.dumps({
+            "type": "req",
+            "id": req_id,
+            "method": method,
+            "params": params or {},
+        }))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=min(10, max(1, deadline - time.time()))))
+            if msg.get("id") != req_id:
+                continue
+            if not msg.get("ok"):
+                return {"ok": False, "error": msg.get("error", {}).get("message", f"{method} failed")}
+            payload = msg.get("payload")
+            if isinstance(payload, dict):
+                payload.setdefault("ok", True)
+                return payload
+            return {"ok": True, "payload": payload}
+    return {"ok": False, "error": f"{method} timed out"}
+
+def _gateway_rpc_call(method, params=None, timeout=20):
+    try:
+        return _run_async_blocking(_gateway_rpc_call_async(method, params=params, timeout=timeout), timeout=timeout + 10)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+def _agent_template_files(name, role, emoji, agent_kind="OpenClaw"):
+    """Return non-secret bootstrap files for a newly-created agent workspace."""
+    return {
+        "IDENTITY.md": f"""# IDENTITY.md
 
 - **Name:** {name}
-- **Creature:** AI assistant
+- **Creature:** {role} — {agent_kind} agent
 - **Vibe:** Helpful, efficient, ready to work
 - **Emoji:** {emoji}
-""")
-        _write_template(workspace_dir, "SOUL.md", f"""# SOUL.md — {name}
+""",
+        "SOUL.md": f"""# SOUL.md — {name}
 
 You are **{name}** {emoji} — {role}.
 
 ## Style
 - Be helpful and direct
 - Follow your AGENTS.md workflow strictly
-- Always set working status before starting and idle when done
-
-## Tool-First Rule
-You ALWAYS start with tool calls before responding with text. Every task requires ALL workflow steps in AGENTS.md — no exceptions.
-""")
-        _write_template(workspace_dir, "USER.md", """# USER.md
+- Keep work visible through Virtual Office when possible
+""",
+        "USER.md": """# USER.md
 
 - **Name:** (set by your owner)
 - **Timezone:** (set by your owner)
 - **Notes:** Prefers direct, clear communication.
-""")
-        _write_template(workspace_dir, "AGENTS.md", f"""# {name} {emoji} — {role}
+""",
+        "AGENTS.md": f"""# {name} {emoji} — {role}
 
 ## Role
 {role}
 
 ## Core Rules
 - Follow instructions carefully
-- Log your work in memory/YYYY-MM-DD.md
-- Always complete the full loop: working → work → report → idle
+- Log your work in memory/YYYY-MM-DD.md when useful
+- Complete the full loop: working → work → report → idle
 
 ## Communication
-- Use `sessions_send` to reach other agents
+- Use Virtual Office communication tools when talking to other office agents
 - Your text reply IS your response — write it directly
 
 ## Memory
 - Daily logs: `memory/YYYY-MM-DD.md`
 - Long-term: `MEMORY.md`
-""")
-        _write_template(workspace_dir, "HEARTBEAT.md", """# HEARTBEAT.md
+""",
+        "HEARTBEAT.md": """# HEARTBEAT.md
 
 # Add periodic tasks below. If nothing needs attention, reply HEARTBEAT_OK.
-""")
-        _write_template(workspace_dir, "MEMORY.md", f"# MEMORY.md - {name}\n\n_No memories yet._\n")
-        _write_template(workspace_dir, "TOOLS.md", f"# TOOLS.md — {name}\n\n_Add tool-specific notes here._\n")
+""",
+        "MEMORY.md": f"# MEMORY.md - {name}\n\n_No memories yet._\n",
+        "TOOLS.md": f"# TOOLS.md — {name}\n\n_Add tool-specific notes here._\n",
+    }
 
-        # 3. Add agent to openclaw.json
-        config_path = os.path.join(WORKSPACE_BASE, "openclaw.json")
-        with open(config_path, "r") as f:
-            config = json.load(f)
+def _default_openclaw_agent_model():
+    """Prefer the running main agent's model over stale global defaults."""
+    result = _gateway_rpc_call("agents.list", {}, timeout=10)
+    if not result.get("ok"):
+        return ""
+    for agent in result.get("agents", []):
+        if agent.get("id") == "main":
+            model = agent.get("model")
+            if isinstance(model, dict):
+                return str(model.get("primary") or "")
+            if isinstance(model, str):
+                return model
+    return ""
 
-        # Get defaults for model and memorySearch
-        defaults = config.get("agents", {}).get("defaults", {})
-        default_model = model or defaults.get("model", {}).get("primary", "anthropic/claude-sonnet-4-6")
-        default_memory = defaults.get("memorySearch", {})
+def _handle_agent_create(body):
+    """Create a new agent from the VO app."""
+    name = (body.get("name") or "").strip()
+    if not name:
+        return {"error": "Agent name is required", "_status": 400}
 
-        new_agent_entry = {
-            "id": agent_id,
-            "workspace": workspace_dir,
-            "model": default_model,
-            "tools": {
-                "allow": [
-                    "group:sessions",
-                    "group:fs",
-                    "group:runtime",
-                    "group:web",
-                    "group:memory",
-                    "message",
-                    "tts"
-                ]
-            },
-        }
-        # Add memorySearch if configured in defaults
-        if default_memory:
-            new_agent_entry["memorySearch"] = default_memory
+    platform = (body.get("agentPlatform") or body.get("platform") or body.get("providerKind") or "openclaw").strip().lower()
+    if platform in {"hermes", "hermes-agent"}:
+        return _handle_hermes_agent_create(body, name)
+    if platform not in {"openclaw", "openclaw-agent"}:
+        return {"error": f"Unsupported agent platform '{platform}'", "_status": 400}
 
-        agent_list = config.get("agents", {}).get("list", [])
-        agent_list.append(new_agent_entry)
-        config["agents"]["list"] = agent_list
+    agent_id = _sanitize_agent_id(body.get("id") or name)
+    emoji = body.get("emoji", "🤖")
+    role = body.get("role", "AI assistant")
+    model = body.get("model", "")
+    workspace_dir = os.path.join(WORKSPACE_BASE, f"workspace-{agent_id}")
 
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+    try:
+        create_params = {"name": name, "workspace": workspace_dir, "emoji": emoji}
+        selected_model = model or _default_openclaw_agent_model()
+        if selected_model:
+            create_params["model"] = selected_model
+        result = _gateway_rpc_call("agents.create", create_params, timeout=30)
+        if not result.get("ok"):
+            status = 409 if "already exists" in str(result.get("error", "")).lower() else 500
+            return {"error": result.get("error", "OpenClaw agent creation failed"), "_status": status}
 
-        # 4. Signal gateway to reload
-        _signal_gateway_reload()
+        agent_id = result.get("agentId") or agent_id
+        for filename, content in _agent_template_files(name, role, emoji, "OpenClaw").items():
+            file_result = _gateway_rpc_call("agents.files.set", {"agentId": agent_id, "name": filename, "content": content}, timeout=20)
+            if not file_result.get("ok"):
+                return {"error": f"Agent created but failed to write {filename}: {file_result.get('error', 'unknown error')}", "_status": 500}
 
-        # 5. Refresh discovery
+        # Refresh discovery
         global _discovered_at
         _discovered_at = 0
         refresh_agent_maps()
@@ -1375,6 +1481,34 @@ You ALWAYS start with tool calls before responding with text. Every task require
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e), "_status": 500}
+
+def _handle_hermes_agent_create(body, name):
+    emoji = body.get("emoji", "⚕️")
+    role = body.get("role", "Hermes Agent")
+    model = body.get("model", "")
+    profile = body.get("id") or body.get("profile") or _sanitize_agent_id(name)
+    provider = HermesProvider(
+        home_path=VO_CONFIG.get("hermes", {}).get("homePath"),
+        binary=VO_CONFIG.get("hermes", {}).get("binary"),
+        enabled=VO_CONFIG.get("hermes", {}).get("enabled", True),
+        timeout_sec=VO_CONFIG.get("hermes", {}).get("timeoutSec", 600),
+    )
+    result = provider.create_agent(name=name, role=role, model=model, emoji=emoji, profile=profile)
+    if not result.get("ok"):
+        return {"error": result.get("error", "Hermes agent creation failed"), "_status": 500}
+    global _discovered_at
+    _discovered_at = 0
+    refresh_agent_maps()
+    return {
+        "ok": True,
+        "agentId": result.get("agentId"),
+        "providerKind": "hermes",
+        "providerAgentId": result.get("profile"),
+        "profile": result.get("profile"),
+        "name": name,
+        "workspace": result.get("workspace"),
+        "message": result.get("message", f"Hermes agent '{name}' created successfully"),
+    }
 
 
 def _write_template(workspace_dir, filename, content):
@@ -4741,7 +4875,7 @@ def _handle_template_delete(template_id):
 
 
 def _handle_agent_delete(body):
-    """Delete an OpenClaw agent — removes from config, agent dir, and workspace."""
+    """Delete an agent from its backing platform."""
     agent_id = (body.get("id") or "").strip()
     if not agent_id:
         return {"error": "Agent ID is required", "_status": 400}
@@ -4750,43 +4884,34 @@ def _handle_agent_delete(body):
     if agent_id == "main":
         return {"error": "Cannot delete the main agent", "_status": 403}
 
-    config_path = os.path.join(WORKSPACE_BASE, "openclaw.json")
-
     try:
-        # 1. Remove from openclaw.json
-        with open(config_path, "r") as f:
-            config = json.load(f)
+        agent = _office_agent_lookup(agent_id)
+        provider_kind = (agent or {}).get("providerKind", "openclaw")
+        if provider_kind == "hermes" or agent_id.startswith("hermes-"):
+            profile = (agent or {}).get("providerAgentId") or agent_id.replace("hermes-", "", 1)
+            provider = HermesProvider(
+                home_path=VO_CONFIG.get("hermes", {}).get("homePath"),
+                binary=VO_CONFIG.get("hermes", {}).get("binary"),
+                enabled=VO_CONFIG.get("hermes", {}).get("enabled", True),
+                timeout_sec=VO_CONFIG.get("hermes", {}).get("timeoutSec", 600),
+            )
+            result = provider.delete_agent(profile)
+            if not result.get("ok"):
+                return {"error": result.get("error", "Hermes agent delete failed"), "_status": 500}
+            try:
+                os.remove(_hermes_history_path(profile))
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"[HERMES] Failed to remove VO history for deleted profile {profile}: {e}")
+        else:
+            result = _gateway_rpc_call("agents.delete", {"agentId": agent_id, "deleteFiles": True}, timeout=30)
+            if not result.get("ok"):
+                status = 404 if "not found" in str(result.get("error", "")).lower() else 500
+                return {"error": result.get("error", "OpenClaw agent delete failed"), "_status": status}
+            _remove_openclaw_agent_paths(agent_id)
 
-        agent_list = config.get("agents", {}).get("list", [])
-        agent_entry = None
-        for a in agent_list:
-            if a.get("id") == agent_id:
-                agent_entry = a
-                break
-
-        if not agent_entry:
-            return {"error": f"Agent '{agent_id}' not found in config", "_status": 404}
-
-        workspace_dir = agent_entry.get("workspace", "")
-        agent_list = [a for a in agent_list if a.get("id") != agent_id]
-        config["agents"]["list"] = agent_list
-
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
-
-        # 2. Remove agent directory (~/.openclaw/agents/<id>/)
-        agent_dir = os.path.join(WORKSPACE_BASE, f"agents/{agent_id}")
-        if os.path.isdir(agent_dir):
-            shutil.rmtree(agent_dir, ignore_errors=True)
-
-        # 3. Remove workspace directory
-        if workspace_dir and os.path.isdir(workspace_dir):
-            shutil.rmtree(workspace_dir, ignore_errors=True)
-
-        # 4. Signal gateway to reload
-        _signal_gateway_reload()
-
-        # 5. Refresh discovery
+        # Refresh discovery
         global _discovered_at
         _discovered_at = 0
         refresh_agent_maps()
@@ -5939,6 +6064,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             # Enforce agent limit in demo mode without hiding whole providers.
             roster = _apply_agent_limit_balanced(roster)
             self.wfile.write(json.dumps({"agents": roster}).encode())
+        elif self.path == "/api/agent-platforms":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(_handle_agent_platforms()).encode())
         elif self.path == "/api/hermes/history" or self.path.startswith("/api/hermes/history?"):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             agent_key = (qs.get("agentId") or qs.get("key") or ["hermes-default"])[0]
