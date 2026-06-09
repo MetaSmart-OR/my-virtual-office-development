@@ -233,4 +233,13 @@ Your license key, office layout, and all settings persist across updates — the
 
 ## License
 
-MIT
+GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`).
+
+Virtual Office remains open source. You may use, modify, host, and
+redistribute it under the AGPL. If you modify the app and make it available
+to users over a network, you must offer those users the corresponding source
+code for your modified version.
+
+Paid license keys unlock the hosted/product feature set and support the
+official distribution. Commercial licensing is available separately for
+organizations that need terms outside the AGPL.
