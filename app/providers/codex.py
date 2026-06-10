@@ -23,6 +23,8 @@ from typing import Any, Callable
 _proc: subprocess.Popen | None = None
 _proc_lock = threading.Lock()   # guards _proc start/reset
 _turn_lock = threading.Lock()   # one active turn at a time
+_active_thread_id: str | None = None  # thread ID of the current/last turn
+_pending_approvals: dict[str, dict] = {}  # itemId → {"params": ..., "rpc_id": ...}
 
 
 def _get_proc() -> subprocess.Popen | None:
@@ -100,8 +102,18 @@ def _start_proc(binary: str) -> subprocess.Popen | None:
     return None
 
 
+_DEBUG = os.environ.get("VO_CODEX_DEBUG", "").strip() == "1"
+
+
+def _dbg(tag: str, msg: str) -> None:
+    if _DEBUG:
+        import sys
+        print(f"[CODEX-DEBUG][{tag}] {msg}", file=sys.stderr, flush=True)
+
+
 def _send_rpc(proc: subprocess.Popen, method: str, params: dict, req_id: int) -> None:
     msg = (json.dumps({"method": method, "id": req_id, "params": params}) + "\n").encode("utf-8")
+    _dbg("SEND", f"id={req_id} method={method} params={json.dumps(params)[:200]}")
     proc.stdin.write(msg)
 
 
@@ -421,6 +433,10 @@ class CodexProvider:
                 gateway_presence.set_manual_override(agent_id, "idle", "")
                 return None
 
+        # Store at module level so respond_approval (different instance) can read it
+        global _active_thread_id
+        _active_thread_id = server_thread_id
+
         req_id += 1
 
         # Phase 2: start the turn with the server-confirmed thread ID
@@ -469,6 +485,13 @@ class CodexProvider:
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
+                    _dbg("RECV", f"bad JSON: {line[:200]}")
+                    continue
+                _dbg("RECV", f"method={event.get('method')} id={event.get('id')} keys={list(event.keys())}")
+                if "error" in event and event.get("id") is not None:
+                    err = event["error"]
+                    err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                    _dbg("RECV", f"RPC error id={event['id']}: {err_msg}")
                     continue
                 if self._handle_event(event, sse_write, agent_id):
                     return server_thread_id
@@ -483,6 +506,7 @@ class CodexProvider:
         import gateway_presence
 
         method = event.get("method", "")
+        _dbg("EVENT", f"method={method!r} params_keys={list((event.get('params') or {}).keys())}")
         params = event.get("params") or {}
 
         if method == "turn/started":
@@ -504,11 +528,14 @@ class CodexProvider:
             sse_write({"type": "delta", "text": delta})
 
         elif method == "item/commandExecution/requestApproval":
+            _dbg("APPROVAL", f"requestApproval rpc_id={event.get('id')} params={json.dumps(params)}")
             approval_id = (
-                params.get("approvalId")
-                or params.get("id")
+                params.get("itemId")
+                or params.get("approvalId")
                 or str(uuid.uuid4())
             )
+            # Store both request params and the JSON-RPC id so we can respond correctly
+            _pending_approvals[approval_id] = {"params": params, "rpc_id": event.get("id")}
             reason = params.get("reason") or params.get("description") or "command execution"
             gateway_presence.set_manual_override(agent_id, "working", "Waiting for approval")
             sse_write({"type": "approval", "id": approval_id, "reason": reason})
@@ -537,14 +564,20 @@ class CodexProvider:
 
     def respond_approval(self, approval_id: str, choice: str) -> dict[str, Any]:
         proc = _get_proc()
+        _dbg("APPROVAL", f"approvalId={approval_id!r} choice={choice!r} proc_alive={proc is not None and proc.poll() is None}")
         if proc is None or proc.poll() is not None:
             return {"ok": False, "error": "No active Codex process"}
         try:
-            req_id = int(time.time() * 1000) % 100000
-            _send_rpc(proc, "approval/respond", {
-                "approvalId": approval_id,
-                "choice": choice,
-            }, req_id)
+            pending = _pending_approvals.pop(approval_id, {})
+            rpc_id = pending.get("rpc_id")
+            if rpc_id is None:
+                return {"ok": False, "error": f"No pending approval for id={approval_id!r}"}
+            decision = "accept" if choice == "allow" else "decline"
+            msg = (json.dumps({"id": rpc_id, "result": {"decision": decision}}) + "\n").encode("utf-8")
+            _dbg("APPROVAL", f"responding to rpc_id={rpc_id} with decision={decision!r}")
+            proc.stdin.write(msg)
+            proc.stdin.flush()
             return {"ok": True}
         except Exception as exc:
+            _dbg("APPROVAL", f"send failed: {exc}")
             return {"ok": False, "error": str(exc)}

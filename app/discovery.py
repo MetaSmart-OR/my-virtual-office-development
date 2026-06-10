@@ -116,7 +116,15 @@ def discover_all_agents(oc_home, hermes_home=None, hermes_bin=None, hermes_enabl
     agents = discover_agents(oc_home)
     agents.extend(discover_hermes_agents(hermes_home=hermes_home, hermes_bin=hermes_bin, enabled=hermes_enabled))
     agents.extend(discover_codex_agents(binary=codex_binary, home=codex_home, enabled=codex_enabled))
-    return agents
+    # Deduplicate by statusKey. Provider-specific entries (codex, hermes) win over
+    # a generic openclaw entry with the same key — they carry the correct providerKind,
+    # emoji, and routing metadata.
+    seen: dict = {}
+    for a in agents:
+        key = a.get("statusKey") or a.get("id")
+        if key not in seen or a.get("providerKind") in ("codex", "hermes"):
+            seen[key] = a
+    return list(seen.values())
 
 
 def _parse_identity(workspace_path):

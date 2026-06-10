@@ -204,7 +204,8 @@
         if (isMatch) matched = true;
       }
       if (!matched) {
-        const fallback = options.find(opt => opt.value === this.selectedAgentKey) || options.find(opt => opt.dataset.sessionKey === this.sessionKey) || options[0];
+        const isOpenClawOpt = opt => !['hermes', 'codex'].includes(opt.dataset.providerKind || 'openclaw');
+        const fallback = options.find(opt => opt.value === this.selectedAgentKey) || options.find(opt => opt.dataset.sessionKey === this.sessionKey) || options.find(isOpenClawOpt) || options[0];
         if (fallback) {
           fallback.selected = true;
           this.selectedAgentKey = fallback.value;
@@ -304,7 +305,7 @@
     }
 
     isCodexSelected() {
-      return this.getSelectedProviderKind() === 'codex';
+      return this.getSelectedProviderKind() === 'codex' || String(this.sessionKey || '').startsWith('codex:');
     }
 
     startHermesApprovalPolling() {
@@ -398,6 +399,8 @@
     async loadHistory(opts = {}) {
       try {
         if (this.isCodexSelected()) {
+          // Don't wipe messages during active streaming or while an approval card is pending
+          if (this.streamingMsg || this.messages.querySelector('.chat-approval-card')) return;
           const agentId = this.getSelectedAgentId() || 'codex';
           const res = await fetch('/api/codex/history?agentId=' + encodeURIComponent(agentId));
           const data = await res.json();
@@ -503,6 +506,21 @@
           const data = await res.json();
           if (!data.ok) throw new Error(data.error || 'clear failed');
           this.resetConversation('New Hermes session started');
+        } catch (e) {
+          this.appendSystem('Reset error: ' + e.message);
+        }
+        return;
+      }
+      if (this.isCodexSelected()) {
+        try {
+          const res = await fetch('/api/codex/history/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ agentId: this.getSelectedAgentId() || this.selectedAgentKey })
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || 'clear failed');
+          this.resetConversation('New Codex session started');
         } catch (e) {
           this.appendSystem('Reset error: ' + e.message);
         }
@@ -821,11 +839,12 @@
     }
 
     async respondApproval(approvalId, choice) {
-      await fetch('/api/codex/approval', {
+      const res = await fetch('/api/codex/approval', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ approvalId, choice })
       });
+      const data = await res.json();
       document.querySelectorAll(`.chat-approval-card[data-approval-id="${approvalId}"]`)
               .forEach(el => el.remove());
       this.updateTypingIndicator('Codex is running...');

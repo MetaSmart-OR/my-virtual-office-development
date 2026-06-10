@@ -318,7 +318,7 @@ AUTH_PROFILES_PATH = os.path.join(WORKSPACE_BASE, "agents/main/agent/auth-profil
 # ─── DYNAMIC AGENT DISCOVERY ─────────────────────────────────
 from discovery import discover_all_agents, get_agent_workspace_dir, get_agent_session_id
 from providers.hermes import HermesProvider
-from providers.codex import CodexProvider
+from providers.codex import CodexProvider, _get_proc as _get_codex_proc, _reset_proc as _reset_codex_proc
 from license import get_license_status, activate_license, deactivate_license, check_feature, get_agent_limit
 from project_store import MarkdownProjectStore
 
@@ -7159,14 +7159,24 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             agents = []
             for a in get_roster():
                 provider_kind = a.get("providerKind", "openclaw")
-                session_key = f"hermes:{a.get('profile', a['id'])}" if provider_kind == "hermes" else f"agent:{a['id']}:main"
+                if provider_kind == "hermes":
+                    session_key = f"hermes:{a.get('profile', a['id'])}"
+                elif provider_kind == "codex":
+                    session_key = f"codex:{a['id']}"
+                else:
+                    session_key = f"agent:{a['id']}:main"
                 # Prefer office-config name/emoji over IDENTITY.md
                 oc = _oc_overrides.get(a["statusKey"], {})
                 # Resolve branch ID to display name
                 branch_id = oc.get("branch", "")
                 branch_name = _oc_branches.get(branch_id, "") if branch_id else ""
                 if not branch_name:
-                    branch_name = "Hermes" if provider_kind == "hermes" else "Unassigned"
+                    if provider_kind == "hermes":
+                        branch_name = "Hermes"
+                    elif provider_kind == "codex":
+                        branch_name = "Codex CLI"
+                    else:
+                        branch_name = "Unassigned"
                 agents.append({
                     "key": a["statusKey"],
                     "agentId": a["id"],
@@ -7184,6 +7194,10 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 })
             # Enforce agent limit in demo mode without hiding whole providers.
             agents = _apply_agent_limit_balanced(agents)
+            # Openclaw agents always appear first in the dropdown regardless of
+            # how the balanced-limit function interleaved providers.
+            _provider_order = {"openclaw": 0, "hermes": 1, "codex": 2}
+            agents.sort(key=lambda a: _provider_order.get(a.get("providerKind", "openclaw"), 99))
             self.wfile.write(json.dumps({"agents": agents}).encode())
         elif self.path == "/gateway-info":
             # Tell the browser WS port + gateway token for chat connection
@@ -8271,6 +8285,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             provider = agent.get("provider") or "Hermes"
             return {"model": model, "provider": provider, "providerKind": "hermes", "contextWindow": 0}
 
+        if agent_id and _is_codex_agent(agent_id):
+            codex_cfg = VO_CONFIG.get("codex", {})
+            provider = CodexProvider(binary=codex_cfg.get("binary"), home=codex_cfg.get("home"), enabled=True)
+            model = "gpt-5.3-codex"
+            return {"model": model, "provider": "openai-codex", "providerKind": "codex", "contextWindow": 200000}
+
         # Known context windows — keyed by full provider/model AND by model name alone.
         # The model-name-only keys act as fallbacks for alternative providers
         # (e.g. openai-codex/gpt-5.4-pro matches via "gpt-5.4-pro" → "gpt-5" family).
@@ -9296,6 +9316,36 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps({"ok": True, "deletedHermesSession": bool(delete_result.get("deleted")), "sessionId": session_id}).encode())
+            return
+        elif self.path == "/api/codex/history/clear":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            agent_key = body.get("agentId") or body.get("key") or "codex"
+            # Kill any running codex process so pending turns/approvals don't linger
+            proc = _get_codex_proc()
+            if proc is not None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            _reset_codex_proc()
+            path = os.path.join(STATUS_DIR, "codex-threads.json")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    threads = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                threads = {}
+            threads.pop(agent_key, None)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(threads, f)
+            except OSError:
+                pass
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True}).encode())
             return
         elif self.path == "/api/hermes/test":
             length = int(self.headers.get('Content-Length', 0))
