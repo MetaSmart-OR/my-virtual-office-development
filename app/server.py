@@ -201,6 +201,7 @@ def _load_vo_config():
     weather_cfg = cfg.get("weather") or {}
     sms_cfg = cfg.get("sms") or {}
     hermes_cfg = cfg.get("hermes") or {}
+    codex_cfg = cfg.get("codex") or {}
 
     return {
         "office": {
@@ -251,6 +252,11 @@ def _load_vo_config():
             "homePath": _env_or("VO_HERMES_HOME", hermes_cfg.get("homePath", os.path.expanduser("~/.hermes"))),
             "binary": _env_or("VO_HERMES_BIN", hermes_cfg.get("binary", os.path.expanduser("~/.local/bin/hermes"))),
             "timeoutSec": int(_env_or("VO_HERMES_TIMEOUT_SEC", hermes_cfg.get("timeoutSec", 600))),
+        },
+        "codex": {
+            "enabled": str(_env_or("VO_CODEX_ENABLED", codex_cfg.get("enabled", True))).lower() not in ("0", "false", "no", "off"),
+            "binary": _env_or("VO_CODEX_BIN", codex_cfg.get("binary")),
+            "home": _env_or("VO_CODEX_HOME", codex_cfg.get("home", os.path.expanduser("~/.codex"))),
         },
     }
 
@@ -312,6 +318,7 @@ AUTH_PROFILES_PATH = os.path.join(WORKSPACE_BASE, "agents/main/agent/auth-profil
 # ─── DYNAMIC AGENT DISCOVERY ─────────────────────────────────
 from discovery import discover_all_agents, get_agent_workspace_dir, get_agent_session_id
 from providers.hermes import HermesProvider
+from providers.codex import CodexProvider
 from license import get_license_status, activate_license, deactivate_license, check_feature, get_agent_limit
 from project_store import MarkdownProjectStore
 
@@ -640,7 +647,7 @@ def _get_agent_workspace_payload(agent_key):
         "lastActiveAt": agent.get("lastActiveAt", 0),
     }
     heartbeat = ""
-    if agent.get("providerKind") != "hermes":
+    if agent.get("providerKind") not in ("hermes", "codex"):
         hb = _resolve_workspace_file(key, agent, "HEARTBEAT.md", allow_new=True)[0]
         if hb and os.path.isfile(hb):
             try:
@@ -661,12 +668,12 @@ def _get_agent_workspace_payload(agent_key):
         "score": _agent_score_info(key),
         "settings": {
             "heartbeatContent": heartbeat,
-            "heartbeatApplicable": agent.get("providerKind") != "hermes",
-            "cronApplicable": agent.get("providerKind") != "hermes",
-            "filesApplicable": agent.get("providerKind") != "hermes",
-            "agentSkillsApplicable": agent.get("providerKind") != "hermes",
+            "heartbeatApplicable": agent.get("providerKind") not in ("hermes", "codex"),
+            "cronApplicable": agent.get("providerKind") not in ("hermes", "codex"),
+            "filesApplicable": agent.get("providerKind") not in ("hermes", "codex"),
+            "agentSkillsApplicable": agent.get("providerKind") not in ("hermes", "codex"),
             "skillLibraryApplicable": True,
-            "modelEditable": agent.get("providerKind") != "hermes",
+            "modelEditable": agent.get("providerKind") not in ("hermes", "codex"),
         },
     }
 
@@ -1177,11 +1184,15 @@ def _ensure_builtin_communication_skill():
 
 def _discover_roster():
     hermes = VO_CONFIG.get("hermes", {})
+    codex = VO_CONFIG.get("codex", {})
     return discover_all_agents(
         WORKSPACE_BASE,
         hermes_home=hermes.get("homePath"),
         hermes_bin=hermes.get("binary"),
         hermes_enabled=hermes.get("enabled", True),
+        codex_binary=codex.get("binary"),
+        codex_home=codex.get("home"),
+        codex_enabled=codex.get("enabled", True),
     )
 
 _discovered_roster = _discover_roster()
@@ -1249,13 +1260,14 @@ def _build_agent_info():
 def _build_agent_workspaces():
     result = {}
     for a in get_roster():
-        if a.get("providerKind") == "hermes":
+        if a.get("providerKind") in ("hermes", "codex"):
             result[a["statusKey"]] = a.get("home") or a.get("workspace") or ""
         else:
-            result[a["statusKey"]] = get_agent_workspace_dir(WORKSPACE_BASE, a["id"]).replace(WORKSPACE_BASE + "/", "") if a["workspace"].startswith(WORKSPACE_BASE) else os.path.basename(a["workspace"])
+            ws = a.get("workspace") or ""
+            result[a["statusKey"]] = get_agent_workspace_dir(WORKSPACE_BASE, a["id"]).replace(WORKSPACE_BASE + "/", "") if ws.startswith(WORKSPACE_BASE) else os.path.basename(ws)
     return result
 def _build_agent_session_ids():
-    return {a["statusKey"]: (a.get("providerAgentId") if a.get("providerKind") == "hermes" else get_agent_session_id(a["id"])) for a in get_roster()}
+    return {a["statusKey"]: (a.get("providerAgentId") if a.get("providerKind") in ("hermes", "codex") else get_agent_session_id(a["id"])) for a in get_roster()}
 
 # Compatibility properties (lazily rebuilt)
 @property
@@ -1354,6 +1366,14 @@ def _is_hermes_agent(agent_id_or_key):
         if needle in (a.get("id"), a.get("statusKey"), a.get("providerAgentId")):
             return a.get("providerKind") == "hermes"
     return needle.startswith("hermes:") or needle.startswith("hermes-")
+
+
+def _is_codex_agent(agent_id_or_key):
+    needle = str(agent_id_or_key or "")
+    for a in get_roster():
+        if needle in (a.get("id"), a.get("statusKey"), a.get("providerAgentId")):
+            return a.get("providerKind") == "codex"
+    return needle == "codex" or needle.startswith("codex:")
 
 
 def _parse_iso_epoch_ms(value):
@@ -2088,6 +2108,56 @@ def _handle_hermes_test(body=None):
     hermes_bin = os.path.expanduser(body.get("binary") or hermes_cfg.get("binary") or "~/.local/bin/hermes")
     hermes_home = os.path.expanduser(body.get("homePath") or hermes_cfg.get("homePath") or "~/.hermes")
     return HermesProvider(home_path=hermes_home, binary=hermes_bin, enabled=True).test()
+
+
+def _handle_codex_test(body=None):
+    """Test the configured Codex installation without starting the App Server."""
+    body = body or {}
+    codex_cfg = VO_CONFIG.get("codex", {})
+    return CodexProvider(
+        binary=body.get("binary") or codex_cfg.get("binary"),
+        home=body.get("home") or codex_cfg.get("home"),
+        enabled=True,
+    ).test()
+
+
+def _get_codex_provider() -> "CodexProvider":
+    codex_cfg = VO_CONFIG.get("codex", {})
+    return CodexProvider(
+        binary=codex_cfg.get("binary"),
+        home=codex_cfg.get("home"),
+        enabled=codex_cfg.get("enabled", True),
+    )
+
+
+def _handle_codex_chat_sse(body: dict, sse_write) -> None:
+    agent_key = body.get("agentId") or "codex"
+    message = (body.get("message") or body.get("text") or "").strip()
+    if not message:
+        sse_write({"type": "error", "text": "Empty message"})
+        return
+
+    provider = _get_codex_provider()
+    if not provider.is_available():
+        sse_write({"type": "error", "text": "Codex not available"})
+        return
+
+    thread_id = provider.get_or_create_thread_id(agent_key, STATUS_DIR)
+    provider.stream_message(
+        thread_id, message, sse_write, "codex",
+        agent_key=agent_key, status_dir=STATUS_DIR,
+    )
+
+
+def _handle_codex_approval_respond(body: dict) -> dict:
+    approval_id = (body.get("approvalId") or body.get("id") or "").strip()
+    choice = (body.get("choice") or "deny").strip().lower()
+    if choice not in ("allow", "deny"):
+        choice = "deny"
+    if not approval_id:
+        return {"ok": False, "error": "approvalId required"}
+    return _get_codex_provider().respond_approval(approval_id, choice)
+
 
 def _handle_agent_platforms():
     """Return agent platforms available to the New Agent workflow."""
@@ -7150,6 +7220,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     agent = _get_hermes_agent(agent_key) or {}
                     profile = agent.get("profile") or agent.get("providerAgentId") or "default"
                     msgs = _load_hermes_history(profile)[-500:]
+                elif _is_codex_agent(agent_key):
+                    provider = _get_codex_provider()
+                    thread_id = provider.get_or_create_thread_id(agent_key, STATUS_DIR)
+                    raw = provider.get_history(thread_id) if thread_id else []
+                    msgs = [{"role": m.get("role", ""), "content": m.get("text", ""), "timestamp": m.get("ts", 0)} for m in raw]
                 else:
                     msgs = get_agent_messages(agent_key, max_messages=500)
                 if msgs:
@@ -7161,7 +7236,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             # This works across all VO instances since they read the same session files.
             project_work = {}
             for agent_key, agent_id in AGENT_SESSION_IDS.items():
-                if _is_hermes_agent(agent_key):
+                if _is_hermes_agent(agent_key) or _is_codex_agent(agent_key):
                     continue
                 try:
                     sdir = os.path.join(WORKSPACE_BASE, f"agents/{agent_id}/sessions")
@@ -7555,6 +7630,25 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path == "/api/hermes/test":
             result = _handle_hermes_test()
             self.send_response(200 if result.get("ok") else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/codex/test":
+            result = _handle_codex_test()
+            self.send_response(200 if result.get("ok") else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path.startswith("/api/codex/history"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            agent_key = (qs.get("agentId") or qs.get("agent_id") or ["codex"])[0]
+            provider = _get_codex_provider()
+            thread_id = provider.get_or_create_thread_id(agent_key, STATUS_DIR)
+            messages = provider.get_history(thread_id) if thread_id else []
+            result = {"ok": True, "messages": messages}
+            self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -9208,6 +9302,51 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_hermes_test(body)
             self.send_response(200 if result.get("ok") else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+        elif self.path == "/api/codex/chat":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            write_lock = threading.Lock()
+            done_event = threading.Event()
+
+            def sse_write(data: dict) -> None:
+                with write_lock:
+                    line = ("data: " + json.dumps(data) + "\n\n").encode("utf-8")
+                    self.wfile.write(line)
+                    self.wfile.flush()
+
+            def _keepalive() -> None:
+                while not done_event.wait(15):
+                    with write_lock:
+                        try:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                        except OSError:
+                            break
+
+            ka_thread = threading.Thread(target=_keepalive, daemon=True)
+            ka_thread.start()
+            try:
+                _handle_codex_chat_sse(body, sse_write)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                gateway_presence.set_manual_override("codex", "idle", "")
+            finally:
+                done_event.set()
+            return
+        elif self.path == "/api/codex/approval":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _handle_codex_approval_respond(body)
+            self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()

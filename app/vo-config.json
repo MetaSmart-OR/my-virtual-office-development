@@ -40,5 +40,10 @@
     "twilioAccountSid": null,
     "twilioAuthToken": null,
     "fromNumber": null
+  },
+  "codex": {
+    "enabled": true,
+    "binary": null,
+    "home": null
   }
 }

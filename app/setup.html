@@ -189,6 +189,32 @@
                 </div>
             </div>
 
+            <div style="border-top:1px solid #333;padding-top:16px;margin-top:18px;">
+                <div style="font-size:13px;color:#ffd700;font-weight:bold;margin-bottom:8px;">⚡ Codex Agents</div>
+                <label style="display:flex;align-items:center;gap:8px;margin-top:8px;">
+                    <input type="checkbox" id="s-codex-enable" checked> Auto-detect local Codex CLI
+                </label>
+                <div style="font-size:13px;color:#999;margin:6px 0 10px;line-height:1.5;">
+                    Virtual Office connects to the OpenAI Codex CLI as an agent. No gateway URL needed — VO spawns it on demand via the Codex App Server.
+                </div>
+                <div id="codex-fields" style="margin-top:10px;">
+                    <label>Codex CLI Path</label>
+                    <input type="text" id="s-codex-bin" placeholder="Auto-detect">
+                    <label>Codex Home Directory</label>
+                    <input type="text" id="s-codex-home" placeholder="/home/youruser/.codex">
+                    <div style="font-size:12px;color:#666;margin:6px 0 12px;line-height:1.5;">
+                        <b>Auth:</b> Codex needs credentials. Either:<br>
+                        • Set <code style="color:#90caf9;">OPENAI_API_KEY</code> in your environment, or<br>
+                        • Run <code style="color:#90caf9;">codex login</code> on the host before starting VO.<br><br>
+                        <b>Running in Docker?</b> Mount the Codex binary and home directory:<br>
+                        <code style="color:#90caf9;font-size:11px;">-v /home/user/.codex:/codex-home</code><br>
+                        <code style="color:#90caf9;font-size:11px;">-v /usr/local/bin/codex:/usr/local/bin/codex</code>
+                    </div>
+                    <button onclick="testCodexConnection()" style="margin:0 0 12px;padding:8px 16px;font-size:9px;">🔍 TEST CODEX</button>
+                    <div id="codex-test-status"></div>
+                </div>
+            </div>
+
             <div class="btn-row">
                 <button class="secondary" onclick="nextStep(1)">← BACK</button>
                 <button onclick="nextStep(3)">NEXT →</button>
@@ -426,6 +452,11 @@
             document.getElementById('hermes-fields').style.display = this.checked ? 'block' : 'none';
         });
 
+        // Codex enable toggle
+        document.getElementById('s-codex-enable').addEventListener('change', function() {
+            document.getElementById('codex-fields').style.display = this.checked ? 'block' : 'none';
+        });
+
         // Pre-populate Hermes fields from current config
         fetch('/vo-config').then(function(r) { return r.json(); }).then(function(cfg) {
             var h = cfg.hermes || {};
@@ -437,6 +468,16 @@
             if (hBin && h.binary) hBin.value = h.binary;
             var hFields = document.getElementById('hermes-fields');
             if (hFields && hEnable) hFields.style.display = hEnable.checked ? 'block' : 'none';
+
+            var c = cfg.codex || {};
+            var cEnable = document.getElementById('s-codex-enable');
+            var cBin = document.getElementById('s-codex-bin');
+            var cHome = document.getElementById('s-codex-home');
+            if (cEnable) cEnable.checked = c.enabled !== false;
+            if (cBin && c.binary) cBin.value = c.binary;
+            if (cHome && c.home) cHome.value = c.home;
+            var cFields = document.getElementById('codex-fields');
+            if (cFields && cEnable) cFields.style.display = cEnable.checked ? 'block' : 'none';
         }).catch(function(){});
 
         function testPcMetrics() {
@@ -504,6 +545,32 @@
                     statusEl.innerHTML = html;
                 } else {
                     statusEl.innerHTML = '<div class="status-box error">❌ Hermes not reachable: ' + (d.error || 'unknown error') + '</div>';
+                }
+            }).catch(function(e) {
+                statusEl.innerHTML = '<div class="status-box error">Error: ' + e.message + '</div>';
+            });
+        }
+
+        function testCodexConnection() {
+            var enabled = document.getElementById('s-codex-enable').checked;
+            var binary = document.getElementById('s-codex-bin').value.trim();
+            var home = document.getElementById('s-codex-home').value.trim();
+            var statusEl = document.getElementById('codex-test-status');
+            if (!enabled) {
+                statusEl.innerHTML = '<div class="status-box info">Codex auto-detect is disabled.</div>';
+                return;
+            }
+            statusEl.innerHTML = '<div class="status-box info">Testing Codex...</div>';
+            fetch('/api/codex/test', {
+                method: 'GET',
+                headers: { 'Content-Type': 'application/json' }
+            }).then(function(r) { return r.json(); }).then(function(d) {
+                if (d.ok) {
+                    statusEl.innerHTML = '<div class="status-box success">✅ Codex ready — ' + (d.version || 'version unknown') + ' · auth: ' + (d.authMethod || 'unknown') + '</div>';
+                } else if (d.authenticated === false && d.version) {
+                    statusEl.innerHTML = '<div class="status-box error">⚠️ Codex found but not authenticated. Run <code>codex login</code> on the host or set <code>OPENAI_API_KEY</code>.</div>';
+                } else {
+                    statusEl.innerHTML = '<div class="status-box error">❌ ' + (d.error || 'Codex not available') + '</div>';
                 }
             }).catch(function(e) {
                 statusEl.innerHTML = '<div class="status-box error">Error: ' + e.message + '</div>';
@@ -678,6 +745,7 @@
             var smsEnabled = document.getElementById('s-sms-enable').checked;
             var pcMetricsEnabled = document.getElementById('s-pcmetrics-enable').checked;
             var hermesEnabled = document.getElementById('s-hermes-enable').checked;
+            var codexEnabled = document.getElementById('s-codex-enable').checked;
             var gwToken = (document.getElementById('s-gateway-token') || {}).value || '';
             var config = {
                 office: { name: document.getElementById('s-name').value || 'Virtual Office' },
@@ -706,6 +774,11 @@
                     enabled: hermesEnabled,
                     homePath: document.getElementById('s-hermes-home').value.trim() || null,
                     binary: document.getElementById('s-hermes-bin').value.trim() || null
+                },
+                codex: {
+                    enabled: codexEnabled,
+                    binary: document.getElementById('s-codex-bin').value.trim() || null,
+                    home: document.getElementById('s-codex-home').value.trim() || null
                 },
                 _setupComplete: true
             };

@@ -7,3 +7,5 @@ __pycache__/
 .DS_Store
 app/vo-config.json
 app/default-office-config.json.bak
+CLAUDE.md
+TASK.md

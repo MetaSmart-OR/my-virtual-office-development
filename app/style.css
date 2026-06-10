@@ -2742,6 +2742,30 @@ button:active { transform: translateY(3px); box-shadow: none; }
     line-height: 1.35;
 }
 
+.chat-approval-card .approval-reason {
+    color: #e8e8f0;
+    margin-bottom: 8px;
+    font-size: 13px;
+    padding: 10px 14px 0;
+}
+.chat-approval-card .approval-reason code {
+    color: #90caf9;
+    font-family: monospace;
+}
+.chat-approval-card .approval-btns {
+    display: flex;
+    gap: 8px;
+    padding: 0 14px 10px;
+}
+.chat-approval-card .approval-btns button {
+    padding: 5px 14px;
+    border-radius: 4px;
+    border: none;
+    cursor: pointer;
+    font-size: 12px;
+}
+.chat-approval-card .approval-allow { background: #2e7d32; color: #fff; }
+.chat-approval-card .approval-deny  { background: #4a0000; color: #fff; }
 .chat-approval-card {
     margin: 4px 0 9px;
     border: 1px solid rgba(255,193,7,0.34);

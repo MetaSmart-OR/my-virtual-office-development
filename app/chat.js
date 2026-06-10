@@ -227,7 +227,7 @@
       this.resetConversation(`${systemPrefix} ${opt.textContent.trim()}`);
       if (this.isHermesSelected()) this.startHermesApprovalPolling();
       else this.stopHermesApprovalPolling();
-      if (connected) {
+      if (connected || this.isHermesSelected() || this.isCodexSelected()) {
         this.loadHistory();
         this.fetchSessionInfo();
       }
@@ -272,7 +272,7 @@
 
     async fetchContextUsage() {
       if (!this.isVisibleForPolling()) return;
-      if (this.isHermesSelected()) return;
+      if (this.isHermesSelected() || this.isCodexSelected()) return;
       try {
         // Avoid broad sessions.list polling. Describe only the selected session.
         const res = await rpc('sessions.describe', { key: this.sessionKey });
@@ -301,6 +301,10 @@
 
     isHermesSelected() {
       return this.getSelectedProviderKind() === 'hermes' || String(this.sessionKey || '').startsWith('hermes:');
+    }
+
+    isCodexSelected() {
+      return this.getSelectedProviderKind() === 'codex';
     }
 
     startHermesApprovalPolling() {
@@ -361,7 +365,7 @@
       let gatewayContext = 0;
       try {
         // Targeted lookup avoids rebuilding the full sessions.list index.
-        if (!this.isHermesSelected()) {
+        if (!this.isHermesSelected() && !this.isCodexSelected()) {
           const res = await rpc('sessions.describe', { key: this.sessionKey });
           const s = res?.payload?.session;
           if (res.ok && s) {
@@ -393,6 +397,21 @@
 
     async loadHistory(opts = {}) {
       try {
+        if (this.isCodexSelected()) {
+          const agentId = this.getSelectedAgentId() || 'codex';
+          const res = await fetch('/api/codex/history?agentId=' + encodeURIComponent(agentId));
+          const data = await res.json();
+          if (data.ok && Array.isArray(data.messages)) {
+            this.messages.innerHTML = '';
+            for (const msg of data.messages) {
+              if (msg.text) {
+                this.appendMessage(msg.role, msg.text, msg.ts || Date.now(), [], msg.role === 'assistant' ? { label: this.agentSelect.selectedOptions[0]?.textContent.trim() || 'Codex', kind: 'agent' } : { label: 'You', kind: 'human' });
+              }
+            }
+            this.scrollBottom();
+          }
+          return;
+        }
         if (this.isHermesSelected()) {
           this.startHermesApprovalPolling();
           const res = await fetch('/api/hermes/history?agentId=' + encodeURIComponent(this.getSelectedAgentId() || this.selectedAgentKey));
@@ -568,7 +587,7 @@
     async sendMessage() {
       let text = this.input.value.trim();
       const hasAttachments = this.pendingAttachments.length > 0;
-      if ((!text && !hasAttachments) || (!connected && !this.isHermesSelected())) return;
+      if ((!text && !hasAttachments) || (!connected && !this.isHermesSelected() && !this.isCodexSelected())) return;
 
       this.input.value = '';
       this.input.style.height = 'auto';
@@ -701,6 +720,11 @@
         return;
       }
 
+      if (this.isCodexSelected()) {
+        await this.sendCodexMessage(text || '(attached files)');
+        return;
+      }
+
       const sendSessionKey = this.sessionKey;
       rpc('chat.send', params).then(res => {
         if (res.ok && res.payload?.runId) {
@@ -710,6 +734,101 @@
           runOwners.set(res.payload.runId, { slotId: this.slotId, sessionKey: sendSessionKey });
         }
       }).catch(e => this.appendSystem('Failed to send: ' + e.message));
+    }
+
+    async sendCodexMessage(text) {
+      this.updateTypingIndicator('Codex is thinking...');
+      try {
+        const resp = await fetch('/api/codex/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agentId: this.getSelectedAgentId(), message: text })
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.error || resp.statusText);
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const chunks = buffer.split('\n\n');
+          buffer = chunks.pop();
+          for (const chunk of chunks) {
+            if (chunk.startsWith(':')) continue;       // SSE keepalive comment
+            if (!chunk.startsWith('data: ')) continue;
+            let event;
+            try { event = JSON.parse(chunk.slice(6)); } catch { continue; }
+            this.handleCodexEvent(event);
+          }
+        }
+      } catch (e) {
+        this.appendSystem('⚠️ Codex error: ' + e.message);
+      } finally {
+        this.removeTypingIndicator();
+      }
+    }
+
+    handleCodexEvent(event) {
+      switch (event.type) {
+        case 'start':
+          this.streamingMsg = { id: 'codex-' + Date.now(), role: 'assistant', content: '' };
+          this.pendingStreamContent = '';
+          this.appendStreamingMessage();
+          break;
+        case 'delta':
+          this.pendingStreamContent = (this.pendingStreamContent || '') + (event.text || '');
+          this.scheduleStreamingRender();
+          break;
+        case 'tool':
+          this.appendToolCall({ stream: 'tool', data: { name: event.name || 'tool', phase: 'start' } });
+          break;
+        case 'approval':
+          this.removeTypingIndicator();
+          this.appendCodexApprovalCard(event.id, event.reason);
+          break;
+        case 'done':
+          this.flushStreamingRender(true);
+          this.finalizeStreamingMessage(event.text || this.pendingStreamContent || '');
+          this.streamingMsg = null;
+          this.pendingStreamContent = '';
+          this.clearActivityFeed();
+          this.scrollBottom();
+          break;
+        case 'error':
+          this.appendSystem('⚠️ Codex: ' + (event.text || 'Unknown error'));
+          break;
+      }
+    }
+
+    appendCodexApprovalCard(approvalId, reason) {
+      const card = document.createElement('div');
+      card.className = 'chat-approval-card';
+      card.dataset.approvalId = approvalId;
+      card.innerHTML = `
+        <div class="approval-reason">Allow: <code>${escHtml(reason || 'command')}</code></div>
+        <div class="approval-btns">
+          <button class="approval-allow">✅ Allow</button>
+          <button class="approval-deny">❌ Deny</button>
+        </div>`;
+      card.querySelector('.approval-allow').onclick = () => this.respondApproval(approvalId, 'allow');
+      card.querySelector('.approval-deny').onclick  = () => this.respondApproval(approvalId, 'deny');
+      this.messages.appendChild(card);
+      this.scrollBottom();
+    }
+
+    async respondApproval(approvalId, choice) {
+      await fetch('/api/codex/approval', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approvalId, choice })
+      });
+      document.querySelectorAll(`.chat-approval-card[data-approval-id="${approvalId}"]`)
+              .forEach(el => el.remove());
+      this.updateTypingIndicator('Codex is running...');
     }
 
     async sendStop() {
@@ -2921,4 +3040,5 @@
   window._resolveOverlaps = _resolveOverlaps;
   window._convertToFloating = _convertToFloating;
   window._getPanelRect = _getPanelRect;
+
 })();

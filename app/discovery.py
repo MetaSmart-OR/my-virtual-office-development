@@ -13,6 +13,7 @@ import re
 import glob
 import time
 from providers.hermes import HermesProvider
+from providers.codex import CodexProvider
 
 def discover_agents(oc_home):
     """
@@ -104,10 +105,17 @@ def discover_hermes_agents(hermes_home=None, hermes_bin=None, enabled=True):
     return HermesProvider(home_path=hermes_home, binary=hermes_bin, enabled=enabled).discover_agents()
 
 
-def discover_all_agents(oc_home, hermes_home=None, hermes_bin=None, hermes_enabled=True):
-    """Discover OpenClaw agents plus optional local Hermes agents."""
+def discover_codex_agents(binary=None, home=None, enabled=True):
+    """Discover the local Codex agent via the App Server CLI."""
+    return CodexProvider(binary=binary, home=home, enabled=enabled).discover_agents()
+
+
+def discover_all_agents(oc_home, hermes_home=None, hermes_bin=None, hermes_enabled=True,
+                        codex_binary=None, codex_home=None, codex_enabled=True):
+    """Discover OpenClaw agents plus optional local Hermes and Codex agents."""
     agents = discover_agents(oc_home)
     agents.extend(discover_hermes_agents(hermes_home=hermes_home, hermes_bin=hermes_bin, enabled=hermes_enabled))
+    agents.extend(discover_codex_agents(binary=codex_binary, home=codex_home, enabled=codex_enabled))
     return agents
 
 
