@@ -400,17 +400,269 @@ function findOpenSpot(spots, excludeId, propX, propY) {
     return null; // all spots taken
 }
 
-function getQueueOffset(x, y, excludeId) {
-    // Count how many agents are near this machine spot, return offset to form a line
-    if (!COLLISION_ENABLED) return { x: 0, y: 0 };
-    let count = 0;
-    for (let i = 0; i < agents.length; i++) {
-        const a = agents[i];
-        if (a.id === excludeId) continue;
-        const dx = a.x - x, dy = a.y - y;
-        if (Math.sqrt(dx * dx + dy * dy) < 40) count++;
+// Generic per-object service queues. Any furniture/action spot can opt in by
+// setting `queue: true` or `queue: { positions: [...] }` in FURNITURE_ACTIONS.
+// The first queue entry owns the service spot; waiting entries map to numbered
+// queue positions 1, 2, 3 before overflowing by the same spacing. Removing the
+// queue field or setting it false unapplies the system for that object/action.
+var OBJECT_SERVICE_QUEUES = {};
+var DEFAULT_OBJECT_QUEUE_POSITIONS = [
+    { x: 0, y: 30, slot: 1 },
+    { x: 0, y: 60, slot: 2 },
+    { x: 0, y: 90, slot: 3 }
+];
+var DEFAULT_OBJECT_QUEUE_SPACING = { x: 0, y: 30 };
+
+function normalizeObjectQueuePosition(pos, fallbackSlot) {
+    pos = pos || {};
+    return {
+        x: pos.x !== undefined ? pos.x : (pos.dx !== undefined ? pos.dx : 0),
+        y: pos.y !== undefined ? pos.y : (pos.dy !== undefined ? pos.dy : DEFAULT_OBJECT_QUEUE_SPACING.y * fallbackSlot),
+        slot: pos.slot || pos.queueSlot || fallbackSlot,
+        faceDir: pos.faceDir
+    };
+}
+
+function getObjectQueueConfig(target) {
+    if (!target) return null;
+    var queueCfg = target.queueConfig;
+    if (queueCfg === undefined && target.furnitureType && FURNITURE_ACTIONS[target.furnitureType]) {
+        queueCfg = FURNITURE_ACTIONS[target.furnitureType].queue;
     }
-    return { x: 0, y: count * 21 }; // queue downward with spacing
+    if (!queueCfg) return null;
+    if (queueCfg === true) queueCfg = {};
+    var rawPositions = queueCfg.positions || queueCfg.slots || queueCfg.queuePositions || DEFAULT_OBJECT_QUEUE_POSITIONS;
+    var positions = [];
+    for (var i = 0; i < rawPositions.length; i++) {
+        positions.push(normalizeObjectQueuePosition(rawPositions[i], i + 1));
+    }
+    if (positions.length === 0) positions = DEFAULT_OBJECT_QUEUE_POSITIONS.slice();
+    return {
+        positions: positions,
+        spacingX: queueCfg.spacingX !== undefined ? queueCfg.spacingX : (queueCfg.dx !== undefined ? queueCfg.dx : DEFAULT_OBJECT_QUEUE_SPACING.x),
+        spacingY: queueCfg.spacingY !== undefined ? queueCfg.spacingY : (queueCfg.dy !== undefined ? queueCfg.dy : DEFAULT_OBJECT_QUEUE_SPACING.y),
+        maxWaiters: queueCfg.maxWaiters || queueCfg.maxQueue || null,
+        label: queueCfg.label || target.label || target.furnitureType || target.action || 'object'
+    };
+}
+
+function getObjectQueueKey(target) {
+    if (!target) return null;
+    if (target.queueKey) return target.queueKey;
+    var type = target.furnitureType || target.type || target.action || 'object';
+    var id = target.furnitureId || (Math.round(target.x) + ',' + Math.round(target.y));
+    return type + ':' + id;
+}
+
+function getObjectQueueAgent(agentId) {
+    if (typeof agentMap !== 'undefined' && agentMap && agentMap[agentId]) return agentMap[agentId];
+    if (typeof agents === 'undefined' || !agents) return null;
+    for (var i = 0; i < agents.length; i++) {
+        if (agents[i].id === agentId) return agents[i];
+    }
+    return null;
+}
+
+function isObjectServiceActionMatch(agentAction, targetAction) {
+    if (!agentAction || !targetAction) return false;
+    if (agentAction === targetAction) return true;
+    var equivalents = {
+        drink: ['get_water'],
+        get_water: ['drink'],
+        coffee: ['make_coffee'],
+        make_coffee: ['coffee'],
+        vend: ['get_snack'],
+        get_snack: ['vend'],
+        microwave: ['make_food'],
+        toaster: ['make_food'],
+        toast: ['make_food'],
+        make_food: ['microwave', 'toaster', 'toast']
+    };
+    return !!(equivalents[agentAction] && equivalents[agentAction].indexOf(targetAction) !== -1);
+}
+
+function findActiveObjectServiceAgent(target, action, excludeId) {
+    if (!target || typeof agents === 'undefined' || !agents) return null;
+    for (var i = 0; i < agents.length; i++) {
+        var a = agents[i];
+        if (!a || a.id === excludeId) continue;
+        if (a.objectQueueKey === getObjectQueueKey(target)) continue;
+        if (!isObjectServiceActionMatch(a.idleAction, action || target.action)) continue;
+        var atServiceSpot = Math.abs(a.x - target.x) < 8 && Math.abs(a.y - target.y) < 8;
+        var headedToServiceSpot = Math.abs(a.targetX - target.x) < 8 && Math.abs(a.targetY - target.y) < 8;
+        if (atServiceSpot || headedToServiceSpot) return a;
+    }
+    return null;
+}
+
+function seedObjectServiceQueueFromActiveAgent(queue, target, opts, queueConfig, key) {
+    if (!queue || queue.entries.length > 0) return;
+    var action = opts.action || target.idleAction || target.action;
+    var activeAgent = findActiveObjectServiceAgent(target, action, opts.excludeAgentId);
+    if (!activeAgent) return;
+    if (activeAgent.objectQueueKey && activeAgent.objectQueueKey !== key) {
+        releaseObjectServiceQueueForAgent(activeAgent, 'queue-key-merge');
+    }
+    queue.entries.push({
+        agentId: activeAgent.id,
+        target: target,
+        action: action || activeAgent.idleAction,
+        serviceTicks: activeAgent.idleReturnTimer || opts.serviceTicks || 600,
+        faceDir: activeAgent.idleFaceDir !== undefined && activeAgent.idleFaceDir !== null ? activeAgent.idleFaceDir : (opts.faceDir !== undefined ? opts.faceDir : -1),
+        queueConfig: queueConfig,
+        startIntent: null,
+        started: true,
+        startIntentShown: true
+    });
+    activeAgent.objectQueueKey = key;
+    activeAgent.objectQueueAction = action || activeAgent.idleAction;
+    activeAgent.objectQueueTarget = target;
+    activeAgent.objectQueueSlot = 0;
+    queue.activeAgentId = activeAgent.id;
+}
+
+function compactObjectServiceQueue(queue) {
+    queue.entries = queue.entries.filter(function(entry) {
+        var agent = getObjectQueueAgent(entry.agentId);
+        return agent && agent.objectQueueKey === queue.key;
+    });
+    queue.activeAgentId = queue.entries.length ? queue.entries[0].agentId : null;
+    return queue.entries.length > 0;
+}
+
+function getObjectQueueEntry(queue, agentId) {
+    if (!queue) return null;
+    for (var i = 0; i < queue.entries.length; i++) {
+        if (queue.entries[i].agentId === agentId) return queue.entries[i];
+    }
+    return null;
+}
+
+function getObjectQueueWaitPosition(entry, waitingIndex) {
+    var cfg = entry.queueConfig || getObjectQueueConfig(entry.target) || { positions: DEFAULT_OBJECT_QUEUE_POSITIONS, spacingX: 0, spacingY: 30 };
+    var positions = cfg.positions && cfg.positions.length ? cfg.positions : DEFAULT_OBJECT_QUEUE_POSITIONS;
+    var pos = positions[waitingIndex];
+    if (!pos) {
+        var last = positions[positions.length - 1] || { x: 0, y: 0, slot: 0 };
+        var overflow = waitingIndex - positions.length + 1;
+        pos = {
+            x: (last.x || 0) + (cfg.spacingX || 0) * overflow,
+            y: (last.y || 0) + (cfg.spacingY || DEFAULT_OBJECT_QUEUE_SPACING.y) * overflow,
+            slot: (last.slot || positions.length) + overflow,
+            faceDir: last.faceDir
+        };
+    }
+    return pos;
+}
+
+function setObjectQueueAgentDestination(agent, entry, index) {
+    var tx = entry.target.x;
+    var ty = entry.target.y;
+    var slot = 0;
+    var slotFaceDir;
+    if (index > 0) {
+        var waitPos = getObjectQueueWaitPosition(entry, index - 1);
+        tx += waitPos.x || 0;
+        ty += waitPos.y || 0;
+        slot = waitPos.slot || index;
+        slotFaceDir = waitPos.faceDir;
+    }
+    if (agent.targetX !== tx || agent.targetY !== ty) {
+        agent.targetX = tx;
+        agent.targetY = ty;
+    }
+    agent.idleFaceDir = slotFaceDir !== undefined ? slotFaceDir : entry.faceDir;
+    agent.objectQueueSlot = slot;
+    if (index === 0 && entry.started) {
+        agent.idleAction = entry.action;
+    } else {
+        agent.idleAction = 'object_queue_wait';
+        agent.idleReturnTimer = 0;
+    }
+}
+
+function updateObjectServiceQueue(queue) {
+    if (!queue || !compactObjectServiceQueue(queue)) {
+        if (queue) delete OBJECT_SERVICE_QUEUES[queue.key];
+        return;
+    }
+    for (var i = 0; i < queue.entries.length; i++) {
+        var entry = queue.entries[i];
+        var agent = getObjectQueueAgent(entry.agentId);
+        if (!agent) continue;
+        setObjectQueueAgentDestination(agent, entry, i);
+    }
+}
+
+function startObjectServiceIfReady(agent) {
+    if (!agent || !agent.objectQueueKey) return false;
+    var queue = OBJECT_SERVICE_QUEUES[agent.objectQueueKey];
+    if (!queue) return false;
+    updateObjectServiceQueue(queue);
+    if (queue.activeAgentId !== agent.id) return false;
+    var entry = getObjectQueueEntry(queue, agent.id);
+    if (!entry || entry.started) return false;
+    var atServiceSpot = Math.abs(agent.x - entry.target.x) < 4 && Math.abs(agent.y - entry.target.y) < 4;
+    if (!atServiceSpot) return false;
+    entry.started = true;
+    agent.idleAction = entry.action;
+    agent.idleReturnTimer = entry.serviceTicks || (600 + Math.floor(Math.random() * 800));
+    agent.interactTimer = 0;
+    if (entry.faceDir !== null && entry.faceDir !== undefined) agent.faceDir = entry.faceDir;
+    if (entry.startIntent && !entry.startIntentShown) {
+        agent.addIntent(entry.startIntent);
+        entry.startIntentShown = true;
+    }
+    return true;
+}
+
+function enqueueAgentForObjectService(agent, target, opts) {
+    if (!agent || !target) return false;
+    opts = opts || {};
+    opts.excludeAgentId = agent.id;
+    var queueConfig = getObjectQueueConfig(target);
+    if (!queueConfig) return false;
+    if (agent.objectQueueKey) releaseObjectServiceQueueForAgent(agent, 'requeue');
+    var key = getObjectQueueKey(target);
+    var queue = OBJECT_SERVICE_QUEUES[key];
+    if (!queue) queue = OBJECT_SERVICE_QUEUES[key] = { key: key, activeAgentId: null, entries: [] };
+    seedObjectServiceQueueFromActiveAgent(queue, target, opts, queueConfig, key);
+    if (queueConfig.maxWaiters !== null && queue.entries.length >= queueConfig.maxWaiters + 1) return false;
+    queue.entries.push({
+        agentId: agent.id,
+        target: target,
+        action: opts.action || target.idleAction || target.action,
+        serviceTicks: opts.serviceTicks || 600,
+        faceDir: opts.faceDir !== undefined ? opts.faceDir : -1,
+        queueConfig: queueConfig,
+        startIntent: opts.startIntent || null,
+        started: false,
+        startIntentShown: false
+    });
+    agent.objectQueueKey = key;
+    agent.objectQueueAction = opts.action || target.action;
+    agent.objectQueueTarget = target;
+    agent.idleReturnTimer = 0;
+    updateObjectServiceQueue(queue);
+    return true;
+}
+
+function releaseObjectServiceQueueForAgent(agent, reason) {
+    if (!agent || !agent.objectQueueKey) return;
+    var key = agent.objectQueueKey;
+    var queue = OBJECT_SERVICE_QUEUES[key];
+    agent.objectQueueKey = null;
+    agent.objectQueueAction = null;
+    agent.objectQueueTarget = null;
+    agent.objectQueueSlot = null;
+    if (!queue) return;
+    queue.entries = queue.entries.filter(function(entry) { return entry.agentId !== agent.id; });
+    if (queue.entries.length === 0) {
+        delete OBJECT_SERVICE_QUEUES[key];
+    } else {
+        queue.activeAgentId = queue.entries[0].agentId;
+        updateObjectServiceQueue(queue);
+    }
 }
 
 // ============================================================
@@ -1643,11 +1895,11 @@ const FURNITURE_ACTIONS = {
     'pingPongTable':  { spots: [{ dx: -50, dy: 0 }, { dx: 50, dy: 0 }], action: 'pong' },
     'desk':           { spots: [{ dx: 0, dy: 0 }],              action: 'work'   },
     'bossDesk':       { spots: [{ dx: 0, dy: 0 }],              action: 'work'   },
-    'waterCooler':    { spots: [{ dx: -6, dy: 54 }],            action: 'drink'  },
-    'coffeeMaker':    { spots: [{ dx: 0, dy: 48 }],             action: 'coffee' },
-    'vendingMachine': { spots: [{ dx: 0, dy: 74 }],             action: 'vend'   },
-    'microwave':      { spots: [{ dx: 0, dy: 56 }],             action: 'microwave' },
-    'toaster':        { spots: [{ dx: 0, dy: 40 }],             action: 'toast'  },
+    'waterCooler':    { spots: [{ dx: -6, dy: 54 }],            action: 'drink',  queue: true },
+    'coffeeMaker':    { spots: [{ dx: 0, dy: 48 }],             action: 'coffee', queue: true },
+    'vendingMachine': { spots: [{ dx: 0, dy: 74 }],             action: 'vend',   queue: true },
+    'microwave':      { spots: [{ dx: 0, dy: 56 }],             action: 'microwave', queue: true },
+    'toaster':        { spots: [{ dx: 0, dy: 40 }],             action: 'toast',  queue: true },
     'window':         { spots: [{ dx: 0, dy: 90 }],             action: 'gaze'   },
     'interactiveWindow': { spots: [{ dx: 0, dy: 90 }],          action: 'gaze'   },
     'bookshelf':      { spots: [{ dx: 0, dy: 90 }],             action: 'read'   },
@@ -1768,7 +2020,11 @@ function getInteractionSpots() {
             if (rot === 90)       { rdx = -spot.dy; rdy = spot.dx; }
             else if (rot === 180) { rdx = -spot.dx; rdy = -spot.dy; }
             else if (rot === 270) { rdx = spot.dy;  rdy = -spot.dx; }
-            var ws = { x: item.x + rdx, y: item.y + rdy };
+            var ws = { x: item.x + rdx, y: item.y + rdy, furnitureId: item.id, furnitureType: item.type, action: action };
+            if (fa.queue) {
+                ws.queueKey = item.type + ':' + (item.id || (Math.round(item.x) + ',' + Math.round(item.y)));
+                ws.queueConfig = fa.queue;
+            }
             if (spot.faceDir !== undefined) ws.faceDir = spot.faceDir;
             switch (action) {
                 case 'sit':
@@ -2248,37 +2504,6 @@ function _drawHeldItem(ctx, item, isMoving) {
     }
 }
 
-function _drawAgentWaterCup(ctx, x, y, fillRatio) {
-    const w = 10;
-    const h = 12;
-    const ratio = Math.max(0, Math.min(1, fillRatio == null ? 1 : fillRatio));
-    const waterTop = y + 1 + Math.round((1 - ratio) * (h - 2));
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(x, y);
-    ctx.lineTo(x + w - 1, y);
-    ctx.lineTo(x + w - 2, y + h - 1);
-    ctx.lineTo(x + 1, y + h - 1);
-    ctx.closePath();
-    ctx.clip();
-
-    ctx.fillStyle = 'rgba(33,150,243,0.95)';
-    ctx.fillRect(x, waterTop, w, y + h - waterTop);
-    ctx.fillStyle = 'rgba(2,136,209,0.9)';
-    ctx.fillRect(x, waterTop, w, 1);
-    ctx.fillStyle = 'rgba(255,255,255,0.28)';
-    ctx.fillRect(x + 2, y + 2, 2, h - 4);
-    ctx.restore();
-
-    ctx.fillStyle = 'rgba(230,245,255,0.55)';
-    ctx.fillRect(x, y, w, 1);
-    ctx.fillStyle = 'rgba(180,210,230,0.4)';
-    ctx.fillRect(x, y + 1, 1, h - 2);
-    ctx.fillRect(x + w - 1, y + 1, 1, h - 2);
-    ctx.fillRect(x + 1, y + h - 1, w - 2, 1);
-}
-
 // --- FACIAL HAIR DRAWING ---
 function _drawFacialHair(ctx, facialHair, facialHairColor) {
     if (!facialHair) return;
@@ -2409,6 +2634,10 @@ class Agent {
         this.carryItemTimer = 0;     // ticks to show item at desk
         this.idleFaceDir = null;     // forced face dir during idle action
         this.interactTimer = 0;      // animation ticks at interaction spot
+        this.objectQueueKey = null;  // concrete queued object key, if waiting/using a queueable object
+        this.objectQueueAction = null;
+        this.objectQueueTarget = null;
+        this.objectQueueSlot = null;
 
         // --- Break room browsing ---
         this.breakPhase = 0;         // 0=entering, 1+=browsing items, final=using
@@ -2533,6 +2762,7 @@ class Agent {
                     this._detourAngle = 0;
                     if (this.idleAction && this.state === 'idle') {
                         // Abort current idle action — go back to desk or pick something else
+                        releaseObjectServiceQueueForAgent(this, 'blocked');
                         this.idleAction = null;
                         this.breakPhase = null;
                         this.breakStops = 0;
@@ -2590,6 +2820,8 @@ class Agent {
                 }
             }
         }
+
+        startObjectServiceIfReady(this);
 
         // --- Autonomous idle wandering ---
         if (this.state === 'idle' && !this.meetingId && !this.idleAction) {
@@ -2660,31 +2892,51 @@ class Agent {
                         const finalItems = ['snack', 'coffee', 'water', 'food'];
                         const choice = this.breakChoice || finalItems[Math.floor(Math.random() * finalItems.length)];
                         let target;
+                        let targetFurnitureType;
                         this.foodSource = null;
-                        if (choice === 'snack') target = inter.vendingMachine;
-                        else if (choice === 'coffee') target = inter.coffeeMaker;
+                        if (choice === 'snack') { target = inter.vendingMachine; targetFurnitureType = 'vendingMachine'; }
+                        else if (choice === 'coffee') { target = inter.coffeeMaker; targetFurnitureType = 'coffeeMaker'; }
                         else if (choice === 'food') {
                             if (inter.microwave && inter.toaster) {
                                 this.foodSource = Math.random() < 0.5 ? 'microwave' : 'toaster';
+                                targetFurnitureType = this.foodSource;
                                 target = this.foodSource === 'microwave' ? inter.microwave : inter.toaster;
                             } else if (inter.microwave) {
                                 this.foodSource = 'microwave';
+                                targetFurnitureType = 'microwave';
                                 target = inter.microwave;
                             } else if (inter.toaster) {
                                 this.foodSource = 'toaster';
+                                targetFurnitureType = 'toaster';
                                 target = inter.toaster;
                             }
-                        } else target = inter.waterCooler;
+                        } else { target = inter.waterCooler; targetFurnitureType = 'waterCooler'; }
                         if (!target) { this.returnToDesk(); return; }
-                        // COLLISION: queue behind others at the machine
-                        const qOff = getQueueOffset(target.x, target.y, this.id);
-                        this.targetX = target.x + qOff.x;
-                        this.targetY = target.y + qOff.y;
-                        this.idleFaceDir = -1;
-                        this.idleAction = choice === 'snack' ? 'get_snack' : choice === 'coffee' ? 'make_coffee' : choice === 'food' ? 'make_food' : 'get_water';
-                        this.interactTimer = 0;
+                        // Use the generic per-object service queue. The queue is attached to
+                        // the chosen target object, so water coolers, coffee makers, vending
+                        // machines, microwaves, toasters, and future queueable furniture all
+                        // share the same FIFO/reservation behavior.
+                        const action = choice === 'snack' ? 'get_snack' : choice === 'coffee' ? 'make_coffee' : choice === 'food' ? 'make_food' : 'get_water';
+                        const queueTarget = Object.assign({}, target, {
+                            furnitureType: target.furnitureType || targetFurnitureType,
+                            action: action,
+                            queueKey: target.queueKey || (targetFurnitureType + ':' + Math.round(target.x) + ',' + Math.round(target.y)),
+                            queueConfig: target.queueConfig
+                        });
                         const labels = { snack: 'a snack', coffee: 'coffee', water: 'water', food: 'something to eat' };
-                        this.idleReturnTimer = 600 + Math.floor(Math.random() * 800); // 10-24s at the machine
+                        const queued = enqueueAgentForObjectService(this, queueTarget, {
+                            action: action,
+                            faceDir: -1,
+                            serviceTicks: 600 + Math.floor(Math.random() * 800),
+                            startIntent: `Getting ${labels[choice]}`
+                        });
+                        if (!queued) {
+                            this.targetX = target.x;
+                            this.targetY = target.y;
+                            this.idleAction = action;
+                            this.idleReturnTimer = 600 + Math.floor(Math.random() * 800); // fallback for non-queueable objects
+                        }
+                        this.interactTimer = 0;
                         this.addIntent(`Decided on ${labels[choice]}!`);
                     }
                 }
@@ -2923,6 +3175,7 @@ class Agent {
         } else {
             this.addIntent('Returning to desk');
         }
+        releaseObjectServiceQueueForAgent(this, 'complete');
         this.idleAction = null;
         this.idleFaceDir = null;
         this.interactTimer = 0;
@@ -2965,6 +3218,7 @@ class Agent {
             if (COLLISION_ENABLED && this.idleAction && this.idleAction !== 'wander' && this.idleAction !== 'visit' && this.idleAction !== 'stretch') {
                 if (isSpotOccupied(this.x, this.y, this.id)) {
                     // Someone beat us here — go back or find alternative
+                    releaseObjectServiceQueueForAgent(this, 'spot-taken');
                     this.idleAction = null;
                     this.breakPhase = null;
                     this.breakStops = 0;
@@ -2983,12 +3237,14 @@ class Agent {
             if (this.idleFaceDir !== null && this.idleFaceDir !== 0) {
                 this.faceDir = this.idleFaceDir;
             }
+            startObjectServiceIfReady(this);
         }
     }
 
     moveTo(state) {
         // Clear idle action when explicitly moved
         if (this._gatheringId) leaveGathering(this.id);
+        releaseObjectServiceQueueForAgent(this, 'moveTo');
         this.idleAction = null;
         this.visitTarget = null;
         this.idleReturnTimer = 0;
@@ -3057,6 +3313,7 @@ class Agent {
 
     // Join a meeting by ID — positions assigned by meeting system
     joinMeeting(meetingId, slot, topic) {
+        releaseObjectServiceQueueForAgent(this, 'joinMeeting');
         this.idleAction = null;
         this.visitTarget = null;
         this.idleReturnTimer = 0;
@@ -3071,6 +3328,7 @@ class Agent {
 
     // 1:1 visit to another agent's desk
     visitAgent(targetAgent, topic) {
+        releaseObjectServiceQueueForAgent(this, 'visitAgent');
         this.idleAction = null;
         this.idleReturnTimer = 0;
         this.visitTarget = targetAgent.id;
@@ -3460,9 +3718,10 @@ class Agent {
                     ctx.fillRect(24, -1 + Math.sin(this.tick * 0.1) * 1, 2, 3);
                     ctx.fillRect(27, -2 + Math.cos(this.tick * 0.08) * 1, 2, 3);
                 } else if (this.carryItem === 'water') {
-                    _drawAgentWaterCup(ctx, 21, 2, 1);
+                    ctx.fillStyle = 'rgba(220,240,255,0.9)'; ctx.fillRect(22, 3, 6, 9);
+                    ctx.fillStyle = 'rgba(33,150,243,0.5)'; ctx.fillRect(23, 6, 4, 5);
                     if (Math.floor(this.tick / 120) % 3 === 0) {
-                        ctx.fillStyle = 'rgba(33,150,243,0.35)'; ctx.fillRect(22, 11, 2, 2);
+                        ctx.fillStyle = 'rgba(33,150,243,0.3)'; ctx.fillRect(22, 10, 2, 2);
                     }
                 } else if (this.carryItem === 'snack') {
                     this._drawSnack(ctx, 22, 4);
@@ -3632,8 +3891,10 @@ class Agent {
             }
             if (this.idleAction === 'get_water' && this.interactTimer > 40) {
                 // Holding cup under spigot
-                const fillRatio = Math.min(1, (this.interactTimer - 40) / 120);
-                _drawAgentWaterCup(ctx, 10, -16, fillRatio);
+                ctx.fillStyle = '#fff'; ctx.fillRect(12, -10, 5, 6);
+                ctx.fillStyle = 'rgba(33,150,243,0.5)';
+                const fillH = Math.min(4, Math.floor((this.interactTimer - 40) / 30));
+                ctx.fillRect(13, -10 + (4 - fillH), 3, fillH);
             }
             if (this.idleAction === 'get_snack' && this.interactTimer > 80) {
                 // Snack dropping from machine
@@ -3793,10 +4054,7 @@ class Agent {
         _drawGlasses(ctx, _appearance.glasses, _appearance.glassesColor, eyeShift);
 
         // --- HELD ITEM (data-driven) ---
-        // Hide cosmetic held items while temporary break items are being fetched,
-        // carried, or consumed so they do not visually replace the water cup.
-        const showProfileHeldItem = !this.carryItem && !['get_snack', 'make_coffee', 'get_water', 'make_food'].includes(this.idleAction);
-        if (showProfileHeldItem) _drawHeldItem(ctx, _appearance.heldItem, isMoving);
+        _drawHeldItem(ctx, _appearance.heldItem, isMoving);
 
         // Identity accessories are now data-driven via the Agent Editor.
         // No hardcoded per-agent accessories.
@@ -3819,7 +4077,8 @@ class Agent {
                 ctx.fillRect(itemX + 2, -22 + Math.sin(this.tick * 0.15) * 1, 2, 3);
                 ctx.fillRect(itemX + 5, -23 + Math.cos(this.tick * 0.15) * 1, 2, 3);
             } else if (this.carryItem === 'water') {
-                _drawAgentWaterCup(ctx, itemX - 1, -20, 1);
+                ctx.fillStyle = 'rgba(220,240,255,0.9)'; ctx.fillRect(itemX, -18, 6, 9);
+                ctx.fillStyle = 'rgba(33,150,243,0.5)'; ctx.fillRect(itemX + 1, -15, 4, 5);
             } else if (this.carryItem === 'snack') {
                 this._drawSnack(ctx, itemX, -16);
             } else if (this.carryItem === 'food') {
@@ -3903,7 +4162,8 @@ class Agent {
                         ctx.fillRect(itemX + 4, itemY - 3 + Math.cos(this.tick * 0.08) * 1, 2, 3);
                     }
                 } else if (this.carryItem === 'water') {
-                    _drawAgentWaterCup(ctx, itemX - 2, itemY + 1, 1);
+                    ctx.fillStyle = 'rgba(220,240,255,0.9)'; ctx.fillRect(itemX - 1, itemY + 2, 6, 9);
+                    ctx.fillStyle = 'rgba(33,150,243,0.5)'; ctx.fillRect(itemX, itemY + 5, 4, 5);
                 } else if (this.carryItem === 'snack') {
                     this._drawSnack(ctx, itemX - 1, itemY + 2);
                     // Crumbs during bite phase
@@ -4505,6 +4765,7 @@ function updateSidebar() {
         if (agent.idleAction === 'read_book') displayState = 'reading';
         if (agent.idleAction === 'look_window') displayState = 'gazing';
         if (agent.idleAction === 'break_browse') displayState = 'browsing';
+        if (agent.idleAction === 'object_queue_wait') displayState = 'queued';
         if (agent.idleAction === 'get_snack') displayState = 'snacking';
         if (agent.idleAction === 'make_food') displayState = 'cooking';
         if (agent.idleAction === 'gathering') displayState = 'socializing';
@@ -7533,20 +7794,24 @@ async function _populateAgentWorkspaceModels(data) {
     var select = document.getElementById('agent-workspace-model-select');
     if (!select || select.dataset.loaded === '1') return;
     try {
-        var res = await fetch('/models', { cache: 'no-store' });
-        var models = await res.json();
-        var current = (data.agent && (models.agentModels || {})[data.agent.statusKey]) || (data.agent && data.agent.model) || models.defaultModel || '';
+        var res = await fetch('/api/native-models', { cache: 'no-store' });
+        var nativeModels = await res.json();
+        var models = nativeModels.openclaw || {};
+        var agentKey = data.agent && data.agent.statusKey;
+        var current = (agentKey && models.agents && models.agents[agentKey] && models.agents[agentKey].model) || (data.agent && data.agent.model) || models.defaultModel || '';
         var html = '<option value="">Use default</option>';
         var grouped = {};
         (models.models || []).forEach(function(m) {
+            if (m.missing) return;
             var provider = m.provider || (m.id && m.id.split('/')[0]) || 'Models';
             if (!grouped[provider]) grouped[provider] = [];
             grouped[provider].push(m);
         });
         Object.keys(grouped).sort().forEach(function(provider) {
             html += '<optgroup label="' + escAttr(provider) + '">';
-            grouped[provider].forEach(function(m) {
-                html += '<option value="' + escAttr(m.id) + '"' + (m.id === current ? ' selected' : '') + '>' + escHtml(m.label || m.id) + '</option>';
+            grouped[provider].sort(function(a, b) { return String(a.id || '').localeCompare(String(b.id || '')); }).forEach(function(m) {
+                var label = (m.name && m.name !== m.id) ? (m.id + ' · ' + m.name) : m.id;
+                html += '<option value="' + escAttr(m.id) + '"' + (m.id === current ? ' selected' : '') + '>' + escHtml(label) + '</option>';
             });
             html += '</optgroup>';
         });
@@ -7582,7 +7847,7 @@ async function _agentWorkspaceSetModel(model) {
     var agent = _agentWorkspace.agent;
     var key = _agentWorkspaceKey(agent);
     if (!key) return { ok: false, error: 'No agent selected' };
-    var res = await fetch('/set-model', {
+    var res = await fetch('/api/native-models/openclaw/agent-model', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agent: key, model: model || '' })

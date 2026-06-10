@@ -24,10 +24,15 @@ import email.utils
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import time
 import gateway_presence
 from zoneinfo import ZoneInfo
+try:
+    import yaml
+except Exception:
+    yaml = None
 
 
 def _normalize_presence_entry(entry):
@@ -311,6 +316,845 @@ def _get_openclaw_version():
 PROJECTS_FILE = os.path.join(STATUS_DIR, "projects.json")
 AGENT_WORKSPACES_FILE = os.path.join(STATUS_DIR, "agent-workspaces.json")
 AUTH_PROFILES_PATH = os.path.join(WORKSPACE_BASE, "agents/main/agent/auth-profiles.json")
+OPENCLAW_HOME = os.path.expanduser(os.environ.get("OPENCLAW_HOME") or WORKSPACE_BASE or "~/.openclaw")
+OPENCLAW_AGENT_DIR = os.path.join(OPENCLAW_HOME, "agents/main/agent")
+
+
+def _first_existing_executable(candidates):
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = os.path.expanduser(candidate)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+OPENCLAW_BIN = (
+    os.environ.get("OPENCLAW_BIN")
+    or VO_CONFIG.get("openclaw", {}).get("binary")
+    or shutil.which("openclaw")
+)
+HERMES_HOME = os.path.expanduser(os.environ.get("HERMES_HOME") or VO_CONFIG.get("hermes", {}).get("homePath") or "~/.hermes")
+HERMES_BIN = (
+    os.environ.get("HERMES_BIN")
+    or VO_CONFIG.get("hermes", {}).get("binary")
+    or shutil.which("hermes")
+)
+
+
+def _run_json_command(args, timeout=30, env=None):
+    """Run a native CLI command that returns JSON."""
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "error": (result.stderr or result.stdout or f"exit {result.returncode}").strip(),
+                "returnCode": result.returncode,
+            }
+        text_out = (result.stdout or "").strip()
+        # Some CLIs print warnings before JSON. Keep the parser tolerant.
+        start = min([i for i in [text_out.find("{"), text_out.find("[")] if i >= 0] or [-1])
+        if start > 0:
+            text_out = text_out[start:]
+        return {"ok": True, "data": json.loads(text_out or "{}")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _run_text_command(args, timeout=30, env=None):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+        return {
+            "ok": result.returncode == 0,
+            "text": (result.stdout or result.stderr or "").strip(),
+            "returnCode": result.returncode,
+        }
+    except Exception as e:
+        return {"ok": False, "text": str(e), "returnCode": -1}
+
+
+def _provider_from_model_id(model_id):
+    return str(model_id or "").split("/", 1)[0] if "/" in str(model_id or "") else ""
+
+
+def _safe_provider_id(value):
+    provider = str(value or "").strip().lower()
+    provider = re.sub(r"[^a-z0-9_.:-]+", "-", provider).strip("-")
+    return provider[:80]
+
+
+def _parse_model_entries(value):
+    entries = []
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = str(value or "").replace(",", "\n").splitlines()
+    seen = set()
+    for item in raw_items:
+        if isinstance(item, dict):
+            model_id = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+            name = str(item.get("name") or model_id).strip()
+            context = item.get("contextWindow") or item.get("context") or 100000
+            max_tokens = item.get("maxTokens") or 8192
+        else:
+            model_id = str(item or "").strip()
+            name = model_id
+            context = 100000
+            max_tokens = 8192
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        try:
+            context = int(context)
+        except Exception:
+            context = 100000
+        try:
+            max_tokens = int(max_tokens)
+        except Exception:
+            max_tokens = 8192
+        entries.append({
+            "id": model_id,
+            "name": name,
+            "contextWindow": context,
+            "maxTokens": max_tokens,
+        })
+    return entries
+
+
+def _mask_secret(value):
+    value = str(value or "")
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "****"
+    return value[:4] + "..." + value[-4:]
+
+
+def _read_openclaw_auth_sqlite():
+    db_path = os.path.join(OPENCLAW_AGENT_DIR, "openclaw-agent.sqlite")
+    profiles = []
+    if not os.path.exists(db_path):
+        return profiles
+    try:
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        tables = [r[0] for r in con.execute("select name from sqlite_master where type='table'")]
+        for table in tables:
+            cols = [r[1] for r in con.execute(f"pragma table_info({table})")]
+            if "store_json" in cols:
+                for row in con.execute(f"select store_json from {table}").fetchall():
+                    try:
+                        data = json.loads(row["store_json"] or "{}")
+                    except Exception:
+                        continue
+                    for profile_id, profile in (data.get("profiles") or {}).items():
+                        provider = profile.get("provider") or profile_id.split(":", 1)[0]
+                        ptype = profile.get("type") or profile.get("mode") or "profile"
+                        email = profile.get("email") or ""
+                        profiles.append({
+                            "id": profile_id,
+                            "provider": provider,
+                            "type": ptype,
+                            "label": profile_id + (f" ({email})" if email else ""),
+                            "source": "sqlite",
+                        })
+                continue
+            if not {"id", "provider"}.issubset(set(cols)):
+                continue
+            type_col = "type" if "type" in cols else ("mode" if "mode" in cols else None)
+            rows = con.execute(f"select * from {table}").fetchall()
+            for row in rows:
+                provider = row["provider"]
+                profile_id = row["id"]
+                if not provider or not profile_id:
+                    continue
+                ptype = row[type_col] if type_col else ""
+                email = row["email"] if "email" in cols else ""
+                label = profile_id + (f" ({email})" if email else "")
+                profiles.append({
+                    "id": profile_id,
+                    "provider": provider,
+                    "type": ptype or "profile",
+                    "label": label,
+                    "source": "sqlite",
+                })
+        con.close()
+    except Exception:
+        return profiles
+    # Deduplicate by id/provider/type.
+    seen = set()
+    unique = []
+    for profile in profiles:
+        key = (profile["id"], profile["provider"], profile["type"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(profile)
+    return unique
+
+
+def _read_openclaw_config_models(cfg):
+    models = []
+    default_model = cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
+    if default_model:
+        models.append({
+            "id": default_model,
+            "key": default_model,
+            "name": default_model.split("/", 1)[-1],
+            "provider": _provider_from_model_id(default_model),
+            "available": True,
+            "missing": False,
+            "tags": ["default"],
+            "source": "openclaw-config",
+        })
+    for model_id, data in cfg.get("agents", {}).get("defaults", {}).get("models", {}).items():
+        models.append({
+            "id": model_id,
+            "key": model_id,
+            "name": model_id.split("/", 1)[-1],
+            "provider": _provider_from_model_id(model_id),
+            "input": ",".join(data.get("input", [])) if isinstance(data, dict) else "",
+            "contextWindow": ((data or {}).get("params") or {}).get("contextWindow", 0) if isinstance(data, dict) else 0,
+            "available": True,
+            "missing": False,
+            "tags": ["configured"],
+            "source": "openclaw-config",
+        })
+    for provider, pdata in cfg.get("models", {}).get("providers", {}).items():
+        for m in pdata.get("models", []):
+            mid = f"{provider}/{m.get('id')}"
+            models.append({
+                "id": mid,
+                "key": mid,
+                "name": m.get("name") or m.get("id"),
+                "provider": provider,
+                "input": ",".join(m.get("input", [])) if isinstance(m.get("input"), list) else m.get("input"),
+                "contextWindow": m.get("contextWindow", 0),
+                "available": True,
+                "missing": False,
+                "tags": [],
+                "source": "openclaw-config",
+            })
+    deduped = {}
+    for model in models:
+        deduped[model["id"]] = {**deduped.get(model["id"], {}), **model}
+    return list(deduped.values())
+
+
+def _get_openclaw_native_fallback(reason=""):
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "models": [], "authProfiles": [], "agents": {}}
+    agents = {}
+    for agent in cfg.get("agents", {}).get("list", []):
+        agents[agent.get("id")] = {
+            "id": agent.get("id"),
+            "workspace": agent.get("workspace"),
+            "model": agent.get("model", ""),
+        }
+    models = _read_openclaw_config_models(cfg)
+    return {
+        "ok": True,
+        "warning": reason or "OpenClaw CLI unavailable; read mounted native config/auth store",
+        "models": models,
+        "authProfiles": _read_openclaw_auth_sqlite(),
+        "authStatus": {"storePath": os.path.join(OPENCLAW_AGENT_DIR, "openclaw-agent.sqlite"), "source": "sqlite-fallback"},
+        "defaultModel": cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""),
+        "agents": agents,
+        "providers": sorted({m["provider"] for m in models if m.get("provider")}),
+        "nativeCommands": {
+            "list": "openclaw models list --all --json",
+            "auth": "openclaw models auth list --json",
+            "status": "openclaw models status --json",
+            "assign": "openclaw config patch / agents.list[].model",
+        },
+    }
+
+
+def _get_openclaw_native_models():
+    """Return OpenClaw's native model/auth/catalog state."""
+    openclaw_bin = OPENCLAW_BIN
+    if not openclaw_bin:
+        return _get_openclaw_native_fallback("OpenClaw CLI binary unavailable in this container")
+    list_result = _run_json_command([openclaw_bin, "models", "list", "--all", "--json"], timeout=45)
+    auth_result = _run_json_command([openclaw_bin, "models", "auth", "list", "--json"], timeout=30)
+    status_result = _run_json_command([openclaw_bin, "models", "status", "--json"], timeout=30)
+
+    if not list_result.get("ok"):
+        return _get_openclaw_native_fallback(list_result.get("error") or "OpenClaw CLI model list failed")
+
+    models = []
+    if list_result.get("ok"):
+        for m in (list_result.get("data") or {}).get("models", []):
+            key = m.get("key") or m.get("id") or ""
+            if not key:
+                continue
+            models.append({
+                "id": key,
+                "key": key,
+                "name": m.get("name") or key.split("/", 1)[-1],
+                "provider": m.get("provider") or _provider_from_model_id(key),
+                "input": m.get("input"),
+                "contextWindow": m.get("contextWindow") or 0,
+                "available": bool(m.get("available", not m.get("missing", False))),
+                "missing": bool(m.get("missing", False)),
+                "local": bool(m.get("local", False)),
+                "tags": m.get("tags") or [],
+                "source": "openclaw",
+            })
+
+    auth_profiles = []
+    if auth_result.get("ok"):
+        auth_profiles = (auth_result.get("data") or {}).get("profiles", [])
+
+    status = status_result.get("data") if status_result.get("ok") else {}
+    agents = {}
+    default_model = ""
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        default_model = cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
+        for agent in cfg.get("agents", {}).get("list", []):
+            agents[agent.get("id")] = {
+                "id": agent.get("id"),
+                "workspace": agent.get("workspace"),
+                "model": agent.get("model", ""),
+            }
+    except Exception:
+        pass
+
+    return {
+        "ok": list_result.get("ok", False),
+        "error": list_result.get("error"),
+        "models": models,
+        "authProfiles": auth_profiles,
+        "authStatus": status.get("auth") if isinstance(status, dict) else None,
+        "defaultModel": default_model,
+        "agents": agents,
+        "providers": sorted({m["provider"] for m in models if m.get("provider")}),
+        "nativeCommands": {
+            "list": "openclaw models list --all --json",
+            "auth": "openclaw models auth list --json",
+            "status": "openclaw models status --json",
+            "assign": "openclaw config patch / agents.list[].model",
+        },
+    }
+
+
+def _load_yaml_file(path):
+    if not os.path.exists(path):
+        return {}
+    if yaml:
+        try:
+            with open(path, "r") as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+    # Minimal fallback parser for model and model_aliases when PyYAML is unavailable.
+    data = {}
+    current = None
+    current_alias = None
+    try:
+        with open(path, "r") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                if not line.startswith(" ") and line.endswith(":"):
+                    current = line[:-1].strip()
+                    current_alias = None
+                    data.setdefault(current, {})
+                    continue
+                if current and line.startswith("  ") and ":" in line:
+                    key, value = line.strip().split(":", 1)
+                    value = value.strip().strip("\"'")
+                    if current == "model_aliases" and not raw.startswith("    ") and not value:
+                        current_alias = key.strip()
+                        data.setdefault(current, {}).setdefault(current_alias, {})
+                    elif current == "model_aliases" and current_alias and raw.startswith("    "):
+                        data.setdefault(current, {}).setdefault(current_alias, {})[key.strip()] = value
+                    else:
+                        data.setdefault(current, {})[key.strip()] = value
+    except Exception:
+        return {}
+    return data
+
+
+def _hermes_profile_config_path(profile_id):
+    profile_id = str(profile_id or "default")
+    if profile_id in ("", "default"):
+        return os.path.join(HERMES_HOME, "config.yaml")
+    return os.path.join(HERMES_HOME, "profiles", profile_id, "config.yaml")
+
+
+def _hermes_args(profile_id, *extra):
+    args = [HERMES_BIN]
+    if profile_id and profile_id != "default":
+        args += ["--profile", profile_id]
+    args += list(extra)
+    return args
+
+
+def _hermes_env():
+    env = dict(os.environ)
+    env["HERMES_HOME"] = HERMES_HOME
+    return env
+
+
+def _parse_hermes_auth_list(text_out):
+    providers = []
+    current = None
+    for raw in (text_out or "").splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if not line.startswith(" ") and line.endswith(":"):
+            current = {"provider": line[:-1], "credentials": []}
+            providers.append(current)
+        elif current and line.strip().startswith("#"):
+            parts = line.strip().split()
+            current["credentials"].append({
+                "label": " ".join(parts[1:-2]) if len(parts) > 3 else line.strip(),
+                "type": parts[-2] if len(parts) >= 2 else "",
+                "source": parts[-1].replace("←", "") if parts else "",
+                "raw": line.strip(),
+            })
+    return providers
+
+
+def _get_hermes_profile_auth(profile_id):
+    paths = []
+    if profile_id and profile_id != "default":
+        paths.append(os.path.join(HERMES_HOME, "profiles", profile_id, "auth.json"))
+    paths.append(os.path.join(HERMES_HOME, "auth.json"))
+    merged = {}
+    for path in paths:
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        for provider, state in (data.get("providers") or {}).items():
+            merged.setdefault(provider, {"provider": provider, "credentials": []})
+            if state:
+                mode = state.get("auth_mode") or state.get("type") or "oauth"
+                merged[provider]["credentials"].append({
+                    "label": provider,
+                    "type": mode,
+                    "source": "auth.json",
+                })
+        for provider, entries in (data.get("credential_pool") or {}).items():
+            if not entries:
+                continue
+            merged.setdefault(provider, {"provider": provider, "credentials": []})
+            for entry in entries:
+                merged[provider]["credentials"].append({
+                    "label": entry.get("label") or entry.get("id") or provider,
+                    "type": entry.get("auth_type") or "",
+                    "source": entry.get("source") or "credential_pool",
+                })
+    return list(merged.values())
+
+
+def _get_hermes_native_models():
+    """Return Hermes profile/model/auth state using Hermes' native config layout."""
+    profiles = []
+    default_cfg = _load_yaml_file(os.path.join(HERMES_HOME, "config.yaml"))
+    if default_cfg:
+        profiles.append(("default", os.path.join(HERMES_HOME, "config.yaml")))
+    profiles_dir = os.path.join(HERMES_HOME, "profiles")
+    if os.path.isdir(profiles_dir):
+        for name in sorted(os.listdir(profiles_dir)):
+            cfg_path = os.path.join(profiles_dir, name, "config.yaml")
+            if os.path.exists(cfg_path):
+                profiles.append((name, cfg_path))
+
+    provider_cache = {}
+    cache_path = os.path.join(HERMES_HOME, "provider_models_cache.json")
+    try:
+        with open(cache_path, "r") as f:
+            cache_data = json.load(f)
+        for provider, entry in cache_data.items():
+            provider_cache[provider] = entry.get("models", []) if isinstance(entry, dict) else []
+    except Exception:
+        pass
+
+    result_profiles = []
+    for profile_id, cfg_path in profiles:
+        cfg = _load_yaml_file(cfg_path)
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        result_profiles.append({
+            "id": profile_id,
+            "configPath": cfg_path,
+            "provider": model_cfg.get("provider") or "",
+            "model": model_cfg.get("default") or model_cfg.get("model") or "",
+            "baseUrl": model_cfg.get("base_url") or "",
+            "auth": _get_hermes_profile_auth(profile_id),
+            "authOk": True,
+        })
+
+    models = []
+    for provider, names in provider_cache.items():
+        for name in names:
+            models.append({
+                "id": f"{provider}/{name}",
+                "provider": provider,
+                "name": name,
+                "source": "hermes",
+                "available": True,
+            })
+
+    model_aliases = {}
+    for profile_id, cfg_path in profiles:
+        cfg = _load_yaml_file(cfg_path)
+        aliases = cfg.get("model_aliases", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(aliases, dict):
+            continue
+        for alias, entry in aliases.items():
+            if not isinstance(entry, dict):
+                continue
+            provider = entry.get("provider") or "custom"
+            model = entry.get("model") or alias
+            base_url = entry.get("base_url") or ""
+            model_aliases[alias] = {
+                "alias": alias,
+                "profile": profile_id,
+                "provider": provider,
+                "model": model,
+                "baseUrl": base_url,
+            }
+            mid = f"{provider}/{model}"
+            if not any(m.get("id") == mid for m in models):
+                models.append({
+                    "id": mid,
+                    "provider": provider,
+                    "name": model,
+                    "source": "hermes-alias",
+                    "available": True,
+                    "baseUrl": base_url,
+                })
+
+    return {
+        "ok": bool(profiles),
+        "profiles": result_profiles,
+        "models": models,
+        "providers": sorted(set(provider_cache.keys()) | {m.get("provider") for m in models if m.get("provider")}),
+        "modelAliases": list(model_aliases.values()),
+        "nativeCommands": {
+            "setup": "hermes model",
+            "auth": "hermes auth list",
+            "assign": "hermes config set model.provider <provider>; hermes config set model.default <model>",
+        },
+    }
+
+
+def _get_native_model_state():
+    return {
+        "openclaw": _get_openclaw_native_models(),
+        "hermes": _get_hermes_native_models(),
+    }
+
+
+def _set_hermes_profile_model(profile_id, provider, model, base_url=""):
+    profile_id = str(profile_id or "default")
+    provider = str(provider or "").strip()
+    model = str(model or "").strip()
+    if not provider or not model:
+        return {"ok": False, "error": "provider and model are required"}
+    if re.search(r"[^a-zA-Z0-9_.:-]", provider):
+        return {"ok": False, "error": "invalid provider id"}
+    cfg_path = _hermes_profile_config_path(profile_id)
+    if not os.path.exists(cfg_path):
+        return {"ok": False, "error": f"Hermes profile config not found: {cfg_path}"}
+    try:
+        with open(cfg_path, "r") as f:
+            lines = f.read().splitlines()
+        output = []
+        in_model = False
+        seen_model = False
+        wrote = {"provider": False, "default": False, "base_url": False}
+        for line in lines:
+            stripped = line.strip()
+            if not line.startswith(" ") and stripped.endswith(":"):
+                if in_model:
+                    if not wrote["default"]:
+                        output.append(f"  default: {model}")
+                    if not wrote["provider"]:
+                        output.append(f"  provider: {provider}")
+                    if base_url and not wrote["base_url"]:
+                        output.append(f"  base_url: {str(base_url).strip()}")
+                in_model = stripped == "model:"
+                seen_model = seen_model or in_model
+                output.append(line)
+                continue
+            if in_model and line.startswith("  ") and ":" in line:
+                key = stripped.split(":", 1)[0]
+                if key == "default":
+                    output.append(f"  default: {model}")
+                    wrote["default"] = True
+                    continue
+                if key == "provider":
+                    output.append(f"  provider: {provider}")
+                    wrote["provider"] = True
+                    continue
+                if key == "base_url" and base_url:
+                    output.append(f"  base_url: {str(base_url).strip()}")
+                    wrote["base_url"] = True
+                    continue
+            output.append(line)
+        if in_model:
+            if not wrote["default"]:
+                output.append(f"  default: {model}")
+            if not wrote["provider"]:
+                output.append(f"  provider: {provider}")
+            if base_url and not wrote["base_url"]:
+                output.append(f"  base_url: {str(base_url).strip()}")
+        if not seen_model:
+            output.extend(["model:", f"  default: {model}", f"  provider: {provider}"])
+            if base_url:
+                output.append(f"  base_url: {str(base_url).strip()}")
+        with open(cfg_path, "w") as f:
+            f.write("\n".join(output) + "\n")
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "profile": profile_id, "provider": provider, "model": model}
+
+
+def _write_yaml_file(path, data):
+    if not yaml:
+        return False, "PyYAML is not available; cannot update Hermes YAML config"
+    try:
+        with open(path, "w") as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _yaml_scalar(value):
+    return json.dumps(str(value or ""))
+
+
+def _read_hermes_aliases_text(lines):
+    aliases = {}
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if line.strip() == "model_aliases:" and not line.startswith(" "):
+            start = i
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                nxt = lines[j]
+                if nxt.strip() and not nxt.startswith(" ") and not nxt.lstrip().startswith("#"):
+                    end = j
+                    break
+            break
+    if start is None:
+        return aliases, None, None
+    current = None
+    for line in lines[start + 1:end]:
+        if line.startswith("  ") and not line.startswith("    ") and line.strip().endswith(":"):
+            current = line.strip()[:-1]
+            aliases.setdefault(current, {})
+            continue
+        if current and line.startswith("    ") and ":" in line:
+            key, value = line.strip().split(":", 1)
+            aliases[current][key.strip()] = value.strip().strip("\"'")
+    return aliases, start, end
+
+
+def _write_hermes_aliases_text(path, aliases):
+    try:
+        with open(path, "r") as f:
+            lines = f.read().splitlines()
+    except Exception as e:
+        return False, str(e)
+    _, start, end = _read_hermes_aliases_text(lines)
+    block = []
+    if aliases:
+        block.append("model_aliases:")
+        for alias in sorted(aliases):
+            entry = aliases[alias] or {}
+            block.append(f"  {alias}:")
+            block.append(f"    model: {_yaml_scalar(entry.get('model') or alias)}")
+            block.append(f"    provider: {_yaml_scalar(entry.get('provider') or 'custom')}")
+            if entry.get("base_url"):
+                block.append(f"    base_url: {_yaml_scalar(entry.get('base_url'))}")
+    if start is None:
+        new_lines = lines + ([""] if lines and lines[-1].strip() else []) + block
+    else:
+        new_lines = lines[:start] + block + lines[end:]
+    try:
+        with open(path, "w") as f:
+            f.write("\n".join(new_lines).rstrip() + "\n")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _update_hermes_aliases_text(path, updater):
+    try:
+        with open(path, "r") as f:
+            lines = f.read().splitlines()
+    except Exception as e:
+        return None, False, str(e)
+    aliases, _, _ = _read_hermes_aliases_text(lines)
+    aliases = updater(aliases)
+    ok, err = _write_hermes_aliases_text(path, aliases)
+    return aliases, ok, err
+
+
+def _save_hermes_api_key(provider, api_key, label=""):
+    provider = _safe_provider_id(provider)
+    api_key = str(api_key or "").strip()
+    label = str(label or "Virtual Office").strip()[:80]
+    if not provider or not api_key:
+        return {"ok": False, "error": "provider and API key are required"}
+    if not HERMES_BIN:
+        return {"ok": False, "error": "Hermes CLI is not configured"}
+    args = [HERMES_BIN, "auth", "add", provider, "--type", "api-key", "--label", label, "--api-key", api_key]
+    result = _run_text_command(args, timeout=30, env=_hermes_env())
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("text") or "Hermes auth add failed"}
+    return {"ok": True, "provider": provider, "label": label, "maskedKey": _mask_secret(api_key)}
+
+
+def _delete_hermes_auth(provider, target):
+    provider = _safe_provider_id(provider)
+    target = str(target or "").strip()
+    if not provider or not target:
+        return {"ok": False, "error": "provider and credential label/id/index are required"}
+    if not HERMES_BIN:
+        return {"ok": False, "error": "Hermes CLI is not configured"}
+    result = _run_text_command([HERMES_BIN, "auth", "remove", provider, target], timeout=30, env=_hermes_env())
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("text") or "Hermes auth remove failed"}
+    return {"ok": True, "provider": provider, "target": target}
+
+
+def _save_hermes_custom_provider(profile_id, provider, base_url, models):
+    profile_id = str(profile_id or "default").strip() or "default"
+    provider = _safe_provider_id(provider) or "custom"
+    base_url = str(base_url or "").strip()
+    entries = _parse_model_entries(models)
+    if not base_url:
+        return {"ok": False, "error": "base URL is required"}
+    if not entries:
+        return {"ok": False, "error": "at least one model is required"}
+    cfg_path = _hermes_profile_config_path(profile_id)
+    if not os.path.exists(cfg_path):
+        return {"ok": False, "error": f"Hermes profile config not found: {cfg_path}"}
+    def update_aliases(aliases):
+        for entry in entries:
+            alias = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", entry["id"]).strip("-")[:100]
+            aliases[alias] = {
+                "model": entry["id"],
+                "provider": provider,
+                "base_url": base_url,
+            }
+        return aliases
+    if yaml:
+        cfg = _load_yaml_file(cfg_path)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        aliases = cfg.setdefault("model_aliases", {})
+        if not isinstance(aliases, dict):
+            aliases = {}
+            cfg["model_aliases"] = aliases
+        update_aliases(aliases)
+        ok, err = _write_yaml_file(cfg_path, cfg)
+        if not ok:
+            return {"ok": False, "error": err}
+    else:
+        _, ok, err = _update_hermes_aliases_text(cfg_path, update_aliases)
+        if not ok:
+            return {"ok": False, "error": err}
+    cache_path = os.path.join(HERMES_HOME, "provider_models_cache.json")
+    try:
+        with open(cache_path, "r") as f:
+            cache_data = json.load(f)
+    except Exception:
+        cache_data = {}
+    cache_data[provider] = {"models": [e["id"] for e in entries], "ts": int(time.time())}
+    try:
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception:
+        pass
+    return {"ok": True, "profile": profile_id, "provider": provider, "modelCount": len(entries)}
+
+
+def _delete_hermes_custom_provider(profile_id, provider):
+    profile_id = str(profile_id or "default").strip() or "default"
+    provider = _safe_provider_id(provider)
+    if not provider:
+        return {"ok": False, "error": "provider is required"}
+    cfg_path = _hermes_profile_config_path(profile_id)
+    if not os.path.exists(cfg_path):
+        return {"ok": False, "error": f"Hermes profile config not found: {cfg_path}"}
+    removed = []
+    def remove_aliases(aliases):
+        for alias, entry in list(aliases.items()):
+            if isinstance(entry, dict) and _safe_provider_id(entry.get("provider")) == provider:
+                removed.append(alias)
+                aliases.pop(alias, None)
+        return aliases
+    if yaml:
+        cfg = _load_yaml_file(cfg_path)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        aliases = cfg.get("model_aliases", {})
+        if isinstance(aliases, dict):
+            remove_aliases(aliases)
+        ok, err = _write_yaml_file(cfg_path, cfg)
+        if not ok:
+            return {"ok": False, "error": err}
+    else:
+        _, ok, err = _update_hermes_aliases_text(cfg_path, remove_aliases)
+        if not ok:
+            return {"ok": False, "error": err}
+    cache_path = os.path.join(HERMES_HOME, "provider_models_cache.json")
+    try:
+        with open(cache_path, "r") as f:
+            cache_data = json.load(f)
+        cache_data.pop(provider, None)
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception:
+        pass
+    return {"ok": True, "profile": profile_id, "provider": provider, "removedAliases": removed}
+
+
+def _save_openclaw_api_key(provider, api_key, profile_id=""):
+    provider = _safe_provider_id(provider)
+    api_key = str(api_key or "").strip()
+    profile_id = str(profile_id or f"{provider}:manual").strip()
+    if not provider or not api_key:
+        return {"ok": False, "error": "provider and API key are required"}
+    if not OPENCLAW_BIN:
+        return {"ok": False, "error": "OpenClaw CLI is not configured"}
+    try:
+        result = subprocess.run(
+            [OPENCLAW_BIN, "models", "auth", "paste-api-key", "--provider", provider, "--profile-id", profile_id],
+            input=api_key + "\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if result.returncode != 0:
+        return {"ok": False, "error": (result.stderr or result.stdout or "OpenClaw auth write failed").strip()}
+    return {"ok": True, "provider": provider, "profileId": profile_id, "maskedKey": _mask_secret(api_key)}
 
 # ─── DYNAMIC AGENT DISCOVERY ─────────────────────────────────
 from discovery import discover_all_agents, get_agent_workspace_dir, get_agent_session_id
@@ -7855,6 +8699,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             models = self._get_models()
             self.wfile.write(json.dumps(models).encode())
+        elif self.path == "/api/native-models":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(_get_native_model_state()).encode())
         elif self.path == "/config/providers":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -8540,11 +9390,18 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
     def _discover_oauth_provider_models(cls):
         """Discover actually-served models for OAuth providers via `openclaw models list`.
 
-        This replaces stale config-based model lists with live discovery,
-        ensuring only models the provider actually serves are shown.
-        Runs for each OAuth provider, caches results for 10 minutes.
+        Read-only legacy helper for older picker surfaces. New model settings
+        use /api/native-models and OpenClaw's native JSON output directly.
         """
-        oauth_providers = ["openai-codex"]  # Add more OAuth providers here as needed
+        oauth_providers = set()
+        try:
+            for profile in _read_openclaw_auth_sqlite():
+                if str(profile.get("type") or "").lower() in {"oauth", "token", "subscription"}:
+                    provider = profile.get("provider")
+                    if provider:
+                        oauth_providers.add(provider)
+        except Exception:
+            pass
 
         for provider in oauth_providers:
             cached = cls._oauth_model_cache.get(provider)
@@ -8552,7 +9409,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 continue  # Still fresh
 
             try:
-                openclaw_bin = shutil.which("openclaw")
+                openclaw_bin = OPENCLAW_BIN
                 if not openclaw_bin:
                     continue
                 result = subprocess.run(
@@ -8570,8 +9427,6 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                         if key:
                             discovered.append(key)
 
-                # Update the config to reflect only discovered models
-                cls._sync_config_models(provider, discovered)
                 cls._oauth_model_cache[provider] = {"models": discovered, "ts": time.time()}
             except Exception:
                 pass  # Silently skip — will retry next cache expiry
@@ -8895,6 +9750,8 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 return self._handle_delete_key(request)
             elif req_type == "save-custom-provider":
                 return self._handle_save_custom_provider(request)
+            elif req_type == "delete-custom-provider":
+                return self._handle_delete_custom_provider(request)
             else:
                 return {"ok": False, "error": f"Unknown request type: {req_type}"}
         except Exception as e:
@@ -8980,8 +9837,10 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_delete_key(self, req):
         """Delete an API key from auth-profiles and openclaw.json."""
-        provider = req["provider"]
-        profile_id = req.get("profileId")
+        provider = _safe_provider_id(req.get("provider", ""))
+        profile_id = str(req.get("profileId") or "").strip()
+        if not provider and not profile_id:
+            return {"ok": False, "error": "provider or profileId is required"}
         deleted = []
 
         try:
@@ -9023,9 +9882,15 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_save_custom_provider(self, req):
         """Save a custom provider (ollama, lmstudio, etc.) to openclaw.json."""
-        provider = req["provider"]
-        base_url = req.get("baseUrl", "")
-        models = req.get("models", [])
+        provider = _safe_provider_id(req.get("provider", ""))
+        base_url = str(req.get("baseUrl", "") or "").strip()
+        models = _parse_model_entries(req.get("models", []))
+        if not provider:
+            return {"ok": False, "error": "provider is required"}
+        if not base_url:
+            return {"ok": False, "error": "base URL is required"}
+        if not models:
+            return {"ok": False, "error": "at least one model is required"}
 
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
@@ -9090,6 +9955,32 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
         self._signal_gateway(restart=False)
         return {"ok": True, "provider": provider, "modelCount": len(new_models)}
+
+    def _delete_custom_provider(self, provider):
+        return self._send_watcher_request({"type": "delete-custom-provider", "provider": provider})
+
+    def _handle_delete_custom_provider(self, req):
+        provider = _safe_provider_id(req.get("provider", ""))
+        if not provider:
+            return {"ok": False, "error": "provider is required"}
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        providers = cfg.setdefault("models", {}).setdefault("providers", {})
+        if provider not in providers:
+            return {"ok": False, "error": f"Provider {provider} is not configured"}
+        providers.pop(provider, None)
+        defaults_models = cfg.setdefault("agents", {}).setdefault("defaults", {}).setdefault("models", {})
+        for model_id in list(defaults_models.keys()):
+            if model_id.startswith(provider + "/"):
+                defaults_models.pop(model_id, None)
+        for agent in cfg.get("agents", {}).get("list", []):
+            if str(agent.get("model") or "").startswith(provider + "/"):
+                agent.pop("model", None)
+        ok, err = self._write_openclaw_config(cfg)
+        if not ok:
+            return {"ok": False, "error": err}
+        self._signal_gateway(restart=False)
+        return {"ok": True, "provider": provider}
 
     @staticmethod
     def _signal_gateway(restart=False):
@@ -9771,6 +10662,113 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             agent_key = body.get("agent", "")
             model_id = body.get("model", "")
             result = self._set_agent_model(agent_key, model_id)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/agent-model":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = self._set_agent_model(body.get("agent", ""), body.get("model", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/auth/api-key":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _save_openclaw_api_key(body.get("provider", ""), body.get("apiKey", ""), body.get("profileId", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/auth/delete":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = self._delete_provider_key(body.get("provider", ""), body.get("profileId", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/provider":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = self._save_custom_provider(
+                _safe_provider_id(body.get("provider", "")),
+                body.get("baseUrl", ""),
+                _parse_model_entries(body.get("models", "")),
+                api=body.get("api", ""),
+                api_key=body.get("apiKey", ""),
+                timeout_seconds=body.get("timeoutSeconds", None),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/provider/delete":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = self._delete_custom_provider(body.get("provider", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/profile-model":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _set_hermes_profile_model(
+                body.get("profile", "default"),
+                body.get("provider", ""),
+                body.get("model", ""),
+                body.get("baseUrl", ""),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/auth/api-key":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _save_hermes_api_key(body.get("provider", ""), body.get("apiKey", ""), body.get("label", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/auth/delete":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _delete_hermes_auth(body.get("provider", ""), body.get("target", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/provider":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _save_hermes_custom_provider(
+                body.get("profile", "default"),
+                body.get("provider", ""),
+                body.get("baseUrl", ""),
+                body.get("models", ""),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/provider/delete":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _delete_hermes_custom_provider(body.get("profile", "default"), body.get("provider", ""))
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")

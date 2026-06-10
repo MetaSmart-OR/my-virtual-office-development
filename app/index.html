@@ -799,7 +799,7 @@
         setTimeout(resizeCanvas, 320);
     }
     </script>
-    <script src="game.js?v=20260608-water-cup-hide-cosmetic-held-item"></script>
+    <script src="game.js?v=20260608-object-queue-active-seed"></script>
     <script src="browser-panel.js?v=0"></script>
     <script src="projects.js?v=0"></script>
     <script>
@@ -942,11 +942,12 @@
         status.textContent = '';
         try {
             if (!_modelsCache) {
-                const res = await fetch('/models');
+                const res = await fetch('/api/native-models');
                 _modelsCache = await res.json();
             }
-            const data = _modelsCache;
-            const currentModel = (data.agentModels || {})[agent.statusKey] || data.defaultModel || '';
+            const nativeData = _modelsCache;
+            const data = nativeData.openclaw || {};
+            const currentModel = ((data.agents || {})[agent.statusKey] || {}).model || data.defaultModel || '';
             sel.innerHTML = '';
             const defOpt = document.createElement('option');
             defOpt.value = '';
@@ -956,6 +957,7 @@
             // Group models by provider
             const groups = {};
             for (const m of (data.models || [])) {
+                if (m.missing) continue;
                 const prov = m.provider || (m.id.includes('/') ? m.id.split('/')[0] : 'other');
                 if (!groups[prov]) groups[prov] = [];
                 groups[prov].push(m);
@@ -963,39 +965,18 @@
 
             // Provider display order and labels
             const provLabels = {
-                'anthropic': 'ANTHROPIC 🔑 API',
-                'anthropic-token': 'ANTHROPIC 🎫 OAuth',
-                'anthropic-oauth': 'ANTHROPIC 🎫 OAuth',
-                'openai': 'OPENAI 🔑 API',
-                'openai-codex': 'OPENAI-CODEX 🎫 OAuth',
-                'openai-codex-oauth': 'OPENAI-CODEX 🎫 OAuth',
+                'anthropic': 'ANTHROPIC',
+                'openai': 'OPENAI',
                 'ollama': 'OLLAMA (Local)',
                 'lmstudio': 'LM STUDIO (Local)',
-                'google': 'GOOGLE'
+                'google': 'GOOGLE',
             };
 
-            if (groups['openai-codex-oauth']) delete groups['openai-codex'];
-
-            // Merge duplicate provider groups (token/oauth variants → base oauth name)
-            const provMerge = {
-                'anthropic-token': 'anthropic-oauth',
-                'openai-codex': 'openai-codex-oauth',
-            };
-            for (const [from, to] of Object.entries(provMerge)) {
-                if (groups[from] && groups[to]) {
-                    groups[to].push(...groups[from]);
-                    delete groups[from];
-                } else if (groups[from]) {
-                    groups[to] = groups[from];
-                    delete groups[from];
-                }
-            }
-
-            const provOrder = ['anthropic', 'anthropic-oauth', 'openai', 'openai-codex-oauth', 'ollama', 'lmstudio', 'google'];
+            const provOrder = ['anthropic', 'openai', 'google', 'ollama', 'lmstudio'];
             const sortedProvs = [...new Set([...provOrder.filter(p => groups[p]), ...Object.keys(groups).filter(p => !provOrder.includes(p))])];
 
             for (const prov of sortedProvs) {
-                const provModels = groups[prov] || [];
+                const provModels = (groups[prov] || []).sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
                 if (provModels.length === 0) continue;
                 const label = provLabels[prov] || prov.toUpperCase();
                 const grp = document.createElement('optgroup');
@@ -1003,7 +984,8 @@
                 for (const m of provModels) {
                     const opt = document.createElement('option');
                     opt.value = m.id;
-                    opt.textContent = m.label || m.id;
+                    const ctx = m.contextWindow ? ' · ' + Math.round(m.contextWindow / 1000) + 'k' : '';
+                    opt.textContent = (m.name && m.name !== m.id ? m.id + ' · ' + m.name : m.id) + ctx;
                     if (m.id === currentModel) opt.selected = true;
                     grp.appendChild(opt);
                 }
@@ -1024,7 +1006,7 @@
         const model = sel.value;
         status.textContent = 'Applying...';
         try {
-            const res = await fetch('/set-model', {
+            const res = await fetch('/api/native-models/openclaw/agent-model', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ agent: agent.statusKey, model: model })
