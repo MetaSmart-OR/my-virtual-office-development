@@ -1,4 +1,4 @@
-// Virtual Office - GBA Pixel Art Visualization
+// Virtual Office - 2D Visualization
 const canvas = document.getElementById('officeCanvas');
 const ctx = canvas.getContext('2d');
 
@@ -2252,7 +2252,7 @@ function _drawHairByConfig(ctx, style, hairColor, hairHighlight) {
             if (hl) { ctx.fillStyle = hl; ctx.fillRect(12, -38, 2, 12); }
             break;
         case 'spiky':
-            // Three spikes for a distinct pixel-art hairstyle.
+            // Three spikes for a distinct 2D hairstyle.
             ctx.fillStyle = hc;
             ctx.fillRect(-12, -41, 24, 5);            // main hair volume
             ctx.fillRect(-13, -38, 26, 2);            // lower edge
@@ -8904,7 +8904,7 @@ function drawAirplanes() {
         const flip = dx < 0 ? -1 : 1;
         ctx.scale(flip, 1);
         ctx.rotate(angle * flip);
-        // Paper airplane pixel art
+        // Paper airplane 2D drawing
         ctx.fillStyle = '#fff';
         // Fuselage
         ctx.fillRect(-6, -1, 12, 2);
@@ -10006,7 +10006,7 @@ class OfficePet {
         ctx.save();
         ctx.translate(px, py);
         ctx.scale(this.faceDir, 1);
-        // Pixel-snapped drawing — no anti-aliasing for pixel-art style
+        // Pixel-snapped drawing, no anti-aliasing for the 2D style
         ctx.imageSmoothingEnabled = false;
 
         if (this.species === 'cat') this._drawCat();
@@ -10061,7 +10061,7 @@ class OfficePet {
     }
 
     _drawCat() {
-        // Soft pixel art — NO black outlines, rounded edges, matches office style
+        // Soft 2D style, no black outlines, rounded edges, matches office style
         // Dark charcoal cat with white chest spot
         var BD = '#2a2030';  // body darkest
         var BM = '#3d3347';  // body main
@@ -10542,7 +10542,7 @@ class OfficePet {
     }
 
     _drawPug() {
-        // Pug dog — fawn body, dark mask, curly tail, stubby, soft pixel art
+        // Pug dog: fawn body, dark mask, curly tail, stubby, soft 2D style
         var BF = '#d4a86a';  // fawn body
         var BD = '#b8904e';  // body dark
         var BL = '#e0be82';  // body light
@@ -11008,7 +11008,7 @@ class OfficePet {
     }
 
     _drawLobster() {
-        // Soft pixel art — NO black outlines, rounded, matches office style
+        // Soft 2D style, no black outlines, rounded, matches office style
         var R = '#d94030';   // main red
         var RD = '#b82820';  // dark red
         var RL = '#e85848';  // light red
