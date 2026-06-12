@@ -2,29 +2,43 @@
 
 🌐 **[myvirtualoffice.ai](https://myvirtualoffice.ai/)**
 
-A self-hosted retro pixel-art AI workspace for [OpenClaw](https://openclaw.ai). Turn invisible agent work into a living, breathing office.
+A self-hosted 2D AI workspace for AI Agents. Turn invisible agent work into a living, breathing office.
 
 ![My Virtual Office](screenshot.png)
 
 ## What Is It?
 
-Virtual Office gives your AI agents a physical presence. Instead of watching logs scroll by, you see agents walking between desks, grabbing coffee, sitting in meetings, and chatting — all in a charming GBA-style pixel-art office that runs in your browser.
+Virtual Office gives your AI agents a physical presence. Instead of watching logs scroll by, you see agents walking between desks, grabbing coffee, sitting in meetings, and chatting in a charming 2D style office that runs in your browser.
 
-It connects to your OpenClaw gateway and visualizes everything your agents are doing in real time.
+It connects to supported agent harnesses and visualizes what your agents are doing in real time.
+
+## Supported Agent Harnesses
+
+### OpenClaw
+
+Virtual Office connects to OpenClaw through the OpenClaw gateway and the mounted OpenClaw home directory. The gateway provides live chat and activity events, while the home directory lets Virtual Office discover agents, read safe profile metadata, load model settings, and surface workspace tools in the UI.
+
+For Docker deployments, mount your OpenClaw home directory into the container and set `VO_OPENCLAW_PATH`, `VO_GATEWAY_URL`, and `VO_GATEWAY_HTTP` when the defaults do not match your setup.
+
+### Hermes Agents
+
+Virtual Office can discover local Hermes Agent profiles as first-class office agents when the Hermes CLI and home directory are available to the app. It uses conservative Hermes CLI surfaces for discovery and status, sends chat messages through `hermes -z` with the selected profile, captures replies from stdout, and stores local Virtual Office history under `VO_STATUS_DIR`.
+
+For Docker deployments, mount or otherwise expose the Hermes home directory and CLI path to the container, then set `VO_HERMES_HOME` and `VO_HERMES_BIN` accordingly. Hermes secrets, private memory files, raw logs, and config internals are not read or exposed by default.
 
 ## Features
 
 ### 🏢 Live Office Canvas
-- Real-time pixel-art office with agents that walk, sit, work, and interact
+- Real-time 2D style office with agents that walk, sit, work, and interact
 - Agents move to their desks when working, wander when idle, visit the kitchen, lounge on the couch
 - Smooth A* pathfinding with collision avoidance
-- Wall occlusion — agents behind walls get naturally shadowed
+- Wall occlusion: agents behind walls get naturally shadowed
 - 100 FPS rendering with configurable canvas size
 
 ### 🎨 Full Office Editor
 - Drag-and-drop furniture placement with snap-to-grid
 - 25+ furniture items: desks, boss desk, meeting table, couches, bookshelves, whiteboards, filing cabinets, plants, vending machines, kitchen appliances, ping pong table, dart board, TV, and more
-- Interior wall builder — create rooms, hallways, and departments with doors
+- Interior wall builder: create rooms, hallways, and departments with doors
 - Wall color picker per section with accent and trim colors
 - Floor tile color customization
 - Rotation support for select furniture (couch)
@@ -41,15 +55,15 @@ It connects to your OpenClaw gateway and visualizes everything your agents are d
 ### 🐾 Office Pet
 - Choose from Cat, Pug, or Lobster
 - Realistic behavior: sleeping, sitting, grooming, wandering, greeting agents, investigating furniture
-- Agents interact with the pet — petting (♥) and playful chasing
+- Agents interact with the pet: petting (♥) and playful chasing
 - Full pathfinding and collision avoidance, same as agents
 - Directional walking sprites (front, back, side views) for cat and pug
-- Custom naming — default pet is a lobster named Clawy
+- Custom naming: default pet is a lobster named Clawy
 
 ### 💬 Chat with Agents
 - Click any agent to open a chat window
 - Full markdown rendering with syntax highlighting
-- Inline image support — send images and see thumbnails in the chat
+- Inline image support: send images and see thumbnails in the chat
 - Click images for full-size lightbox view
 - Voice input via Whisper STT (premium)
 - File attachments with drag-and-drop or paste
@@ -60,21 +74,21 @@ It connects to your OpenClaw gateway and visualizes everything your agents are d
 - Agent selector dropdown to switch between agents
 
 ### 📊 Dashboard Panel
-- **PC Performance** — live CPU and RAM monitoring
-- **API Usage** — track agent API calls and costs
-- **Branch Management** — organize agents into departments/teams with color-coded borders
-- **Agent Directory** — see all agents with live status (working, idle, meeting, break)
-- **Activity Log** — real-time feed of office events
+- **PC Performance**: live CPU and RAM monitoring
+- **API Usage**: track agent API calls and costs
+- **Branch Management**: organize agents into departments/teams with color-coded borders
+- **Agent Directory**: see all agents with live status (working, idle, meeting, break)
+- **Activity Log**: real-time feed of office events
 
 ### 🌦️ Dynamic Environment
 - **Interactive windows** with live weather pulled from your location
-- **Day/night cycle** — ambient lighting shifts throughout the day
-- **Animated furniture** — TV with 5 channels (sports, news, cooking, cartoon, movie) that agents walk over to watch
+- **Day/night cycle**: ambient lighting shifts throughout the day
+- **Animated furniture**: TV with 5 channels (sports, news, cooking, cartoon, movie) that agents walk over to watch
 - **Clock** showing real time
 
 ### 📋 Meeting System
-- 1-on-1 meetings — agents walk to each other's desks
-- Group meetings — agents gather around the meeting table (10 seats, 5 per side)
+- 1-on-1 meetings: agents walk to each other's desks
+- Group meetings: agents gather around the meeting table (10 seats, 5 per side)
 - Meetings triggered by agent activity or manual scheduling
 - Meeting status visible in dashboard
 
@@ -85,11 +99,11 @@ It connects to your OpenClaw gateway and visualizes everything your agents are d
 - Branch themes and emoji customization
 
 ### 🔧 Additional Tools (Premium)
-- **Agent Browser** — embedded browser with live view, URL bar, and remote control
-- **SMS Panel** — Twilio integration for SMS/phone from the office
-- **Cron Manager** — schedule recurring agent tasks visually
-- **Models Panel** — per-agent model switching from the UI
-- **Whisper STT** — voice-to-text input in chat
+- **Agent Browser**: embedded browser with live view, URL bar, and remote control
+- **SMS Panel**: Twilio integration for SMS/phone from the office
+- **Cron Manager**: schedule recurring agent tasks visually
+- **Models Panel**: per-agent model switching from the UI
+- **Whisper STT**: voice-to-text input in chat
 
 ## Quick Start
 
@@ -117,7 +131,7 @@ That means the same image tag works on standard x86_64 machines and ARM64 device
 ### First Run
 
 1. Open `http://localhost:8090/setup`
-2. Follow the setup wizard to connect your OpenClaw instance
+2. Follow the setup wizard to connect your OpenClaw instance, Hermes Agents, or both
 3. Enter a license key or skip for demo mode
 4. Customize your office, add agents, and watch them come to life
 
@@ -125,18 +139,18 @@ That means the same image tag works on standard x86_64 machines and ARM64 device
 
 **Recommended remote access: use [Tailscale](https://tailscale.com/).**
 
-Virtual Office is a control surface for your local OpenClaw instance. If you want to reach it away from home, the safest default is to keep it on your private machine or LAN and access it over a private tailnet such as Tailscale.
+Virtual Office is a control surface for your local agent harnesses. If you want to reach it away from home, the safest default is to keep it on your private machine or LAN and access it over a private tailnet such as Tailscale.
 
 ### Recommended setup
 - Keep Virtual Office bound to your local machine, LAN, or private tailnet
 - Use Tailscale to reach the host remotely instead of opening router ports
-- Keep your OpenClaw gateway and Virtual Office behind trusted access controls
+- Keep your agent harnesses and Virtual Office behind trusted access controls
 - Use strong device/account security on the machines that can reach your tailnet
 
 ### Warning
 - **Do not expose Virtual Office directly to the public internet unless you fully understand and accept the security risk**
-- Avoid simple port forwarding for ports `8090`, `8091`, or your OpenClaw gateway
-- If someone can reach your Virtual Office deployment, they may be able to interact with a live control surface for your OpenClaw agents
+- Avoid simple port forwarding for ports `8090`, `8091`, or your agent harness gateways
+- If someone can reach your Virtual Office deployment, they may be able to interact with a live control surface for your agents
 
 This project is designed first for self-hosted local/private-network use. You are responsible for securing any remote deployment.
 
@@ -194,18 +208,6 @@ All settings live in `vo-config.json`. Environment variables override config val
 | `VO_STATUS_DIR` | /data | Directory for presence/status data inside the container. By default this is backed by the `vo-data` Docker volume. |
 | `VO_WEATHER_LOCATION` | *(none)* | Weather location for window display |
 
-### Hermes Agent compatibility
-
-Virtual Office can now discover local Hermes Agent profiles as first-class office agents when the Hermes CLI and home directory are available to the app. The adapter is intentionally conservative:
-
-- discovery/status uses safe Hermes CLI surfaces (`profile list`, `profile show`, `status`-style metadata)
-- chat sends one-shot messages through `hermes -z` using the selected Hermes profile
-- replies are captured from stdout
-- local Virtual Office history is stored under `VO_STATUS_DIR`
-- Hermes secrets/config/memories/raw logs are not read or exposed by default
-
-For Docker deployments, mount or otherwise expose the Hermes home and CLI path to the container, then set `VO_HERMES_HOME` and `VO_HERMES_BIN` accordingly.
-
 ## Updating
 
 ```bash
@@ -220,7 +222,7 @@ Or pull the image directly:
 docker pull ghcr.io/eliautobot/my-virtual-office:latest
 ```
 
-Your license key, office layout, and all settings persist across updates — they're stored in the `vo-data` volume.
+Your license key, office layout, and all settings persist across updates. They're stored in the `vo-data` volume.
 
 ## Roadmap
 
@@ -233,4 +235,13 @@ Your license key, office layout, and all settings persist across updates — the
 
 ## License
 
-MIT
+GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`).
+
+Virtual Office remains open source. You may use, modify, host, and
+redistribute it under the AGPL. If you modify the app and make it available
+to users over a network, you must offer those users the corresponding source
+code for your modified version.
+
+Paid license keys unlock the hosted/product feature set and support the
+official distribution. Commercial licensing is available separately for
+organizations that need terms outside the AGPL.

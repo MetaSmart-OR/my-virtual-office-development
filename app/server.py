@@ -24,10 +24,15 @@ import email.utils
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import time
 import gateway_presence
 from zoneinfo import ZoneInfo
+try:
+    import yaml
+except Exception:
+    yaml = None
 
 
 def _normalize_presence_entry(entry):
@@ -76,7 +81,7 @@ def _normalize_presence_entry(entry):
     # Active lifecycle/tool sources can be silent during long commands. Generic
     # chat/snapshot display states must still age out if maintenance missed the
     # terminal event, otherwise disconnected apps can show stale working status.
-    has_active_work_source = source_lower.startswith(("agent-lifecycle", "agent-tool", "session-tool", "gateway"))
+    has_active_work_source = source_lower.startswith(("agent-lifecycle", "agent-tool", "session-tool", "gateway", "hermes-", "provider-"))
     stale_limit_sec = 180 if (
         "tool" in source_lower or "command" in source_lower or
         any(token in task_lower for token in ("reading", "processing", "thinking", "running command", "editing", "writing", "searching", "fetching"))
@@ -252,6 +257,9 @@ def _load_vo_config():
             "homePath": _env_or("VO_HERMES_HOME", hermes_cfg.get("homePath", os.path.expanduser("~/.hermes"))),
             "binary": _env_or("VO_HERMES_BIN", hermes_cfg.get("binary", os.path.expanduser("~/.local/bin/hermes"))),
             "timeoutSec": int(_env_or("VO_HERMES_TIMEOUT_SEC", hermes_cfg.get("timeoutSec", 600))),
+            "apiUrl": _env_or("VO_HERMES_API_URL", hermes_cfg.get("apiUrl", "http://127.0.0.1:8642")),
+            "apiKey": _env_or("VO_HERMES_API_KEY", hermes_cfg.get("apiKey", "")),
+            "preferApi": str(_env_or("VO_HERMES_PREFER_API", hermes_cfg.get("preferApi", True))).lower() not in ("0", "false", "no", "off"),
         },
         "codex": {
             "enabled": str(_env_or("VO_CODEX_ENABLED", codex_cfg.get("enabled", True))).lower() not in ("0", "false", "no", "off"),
@@ -314,10 +322,849 @@ def _get_openclaw_version():
 PROJECTS_FILE = os.path.join(STATUS_DIR, "projects.json")
 AGENT_WORKSPACES_FILE = os.path.join(STATUS_DIR, "agent-workspaces.json")
 AUTH_PROFILES_PATH = os.path.join(WORKSPACE_BASE, "agents/main/agent/auth-profiles.json")
+OPENCLAW_HOME = os.path.expanduser(os.environ.get("OPENCLAW_HOME") or WORKSPACE_BASE or "~/.openclaw")
+OPENCLAW_AGENT_DIR = os.path.join(OPENCLAW_HOME, "agents/main/agent")
+
+
+def _first_existing_executable(candidates):
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = os.path.expanduser(candidate)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+OPENCLAW_BIN = (
+    os.environ.get("OPENCLAW_BIN")
+    or VO_CONFIG.get("openclaw", {}).get("binary")
+    or shutil.which("openclaw")
+)
+HERMES_HOME = os.path.expanduser(os.environ.get("HERMES_HOME") or VO_CONFIG.get("hermes", {}).get("homePath") or "~/.hermes")
+HERMES_BIN = (
+    os.environ.get("HERMES_BIN")
+    or VO_CONFIG.get("hermes", {}).get("binary")
+    or shutil.which("hermes")
+)
+
+
+def _run_json_command(args, timeout=30, env=None):
+    """Run a native CLI command that returns JSON."""
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "error": (result.stderr or result.stdout or f"exit {result.returncode}").strip(),
+                "returnCode": result.returncode,
+            }
+        text_out = (result.stdout or "").strip()
+        # Some CLIs print warnings before JSON. Keep the parser tolerant.
+        start = min([i for i in [text_out.find("{"), text_out.find("[")] if i >= 0] or [-1])
+        if start > 0:
+            text_out = text_out[start:]
+        return {"ok": True, "data": json.loads(text_out or "{}")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _run_text_command(args, timeout=30, env=None):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+        return {
+            "ok": result.returncode == 0,
+            "text": (result.stdout or result.stderr or "").strip(),
+            "returnCode": result.returncode,
+        }
+    except Exception as e:
+        return {"ok": False, "text": str(e), "returnCode": -1}
+
+
+def _provider_from_model_id(model_id):
+    return str(model_id or "").split("/", 1)[0] if "/" in str(model_id or "") else ""
+
+
+def _safe_provider_id(value):
+    provider = str(value or "").strip().lower()
+    provider = re.sub(r"[^a-z0-9_.:-]+", "-", provider).strip("-")
+    return provider[:80]
+
+
+def _parse_model_entries(value):
+    entries = []
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = str(value or "").replace(",", "\n").splitlines()
+    seen = set()
+    for item in raw_items:
+        if isinstance(item, dict):
+            model_id = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+            name = str(item.get("name") or model_id).strip()
+            context = item.get("contextWindow") or item.get("context") or 100000
+            max_tokens = item.get("maxTokens") or 8192
+        else:
+            model_id = str(item or "").strip()
+            name = model_id
+            context = 100000
+            max_tokens = 8192
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        try:
+            context = int(context)
+        except Exception:
+            context = 100000
+        try:
+            max_tokens = int(max_tokens)
+        except Exception:
+            max_tokens = 8192
+        entries.append({
+            "id": model_id,
+            "name": name,
+            "contextWindow": context,
+            "maxTokens": max_tokens,
+        })
+    return entries
+
+
+def _mask_secret(value):
+    value = str(value or "")
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "****"
+    return value[:4] + "..." + value[-4:]
+
+
+def _read_openclaw_auth_sqlite():
+    db_path = os.path.join(OPENCLAW_AGENT_DIR, "openclaw-agent.sqlite")
+    profiles = []
+    if not os.path.exists(db_path):
+        return profiles
+    try:
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        tables = [r[0] for r in con.execute("select name from sqlite_master where type='table'")]
+        for table in tables:
+            cols = [r[1] for r in con.execute(f"pragma table_info({table})")]
+            if "store_json" in cols:
+                for row in con.execute(f"select store_json from {table}").fetchall():
+                    try:
+                        data = json.loads(row["store_json"] or "{}")
+                    except Exception:
+                        continue
+                    for profile_id, profile in (data.get("profiles") or {}).items():
+                        provider = profile.get("provider") or profile_id.split(":", 1)[0]
+                        ptype = profile.get("type") or profile.get("mode") or "profile"
+                        email = profile.get("email") or ""
+                        profiles.append({
+                            "id": profile_id,
+                            "provider": provider,
+                            "type": ptype,
+                            "label": profile_id + (f" ({email})" if email else ""),
+                            "source": "sqlite",
+                        })
+                continue
+            if not {"id", "provider"}.issubset(set(cols)):
+                continue
+            type_col = "type" if "type" in cols else ("mode" if "mode" in cols else None)
+            rows = con.execute(f"select * from {table}").fetchall()
+            for row in rows:
+                provider = row["provider"]
+                profile_id = row["id"]
+                if not provider or not profile_id:
+                    continue
+                ptype = row[type_col] if type_col else ""
+                email = row["email"] if "email" in cols else ""
+                label = profile_id + (f" ({email})" if email else "")
+                profiles.append({
+                    "id": profile_id,
+                    "provider": provider,
+                    "type": ptype or "profile",
+                    "label": label,
+                    "source": "sqlite",
+                })
+        con.close()
+    except Exception:
+        return profiles
+    # Deduplicate by id/provider/type.
+    seen = set()
+    unique = []
+    for profile in profiles:
+        key = (profile["id"], profile["provider"], profile["type"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(profile)
+    return unique
+
+
+def _read_openclaw_config_models(cfg):
+    models = []
+    default_model = cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
+    if default_model:
+        models.append({
+            "id": default_model,
+            "key": default_model,
+            "name": default_model.split("/", 1)[-1],
+            "provider": _provider_from_model_id(default_model),
+            "available": True,
+            "missing": False,
+            "tags": ["default"],
+            "source": "openclaw-config",
+        })
+    for model_id, data in cfg.get("agents", {}).get("defaults", {}).get("models", {}).items():
+        models.append({
+            "id": model_id,
+            "key": model_id,
+            "name": model_id.split("/", 1)[-1],
+            "provider": _provider_from_model_id(model_id),
+            "input": ",".join(data.get("input", [])) if isinstance(data, dict) else "",
+            "contextWindow": ((data or {}).get("params") or {}).get("contextWindow", 0) if isinstance(data, dict) else 0,
+            "available": True,
+            "missing": False,
+            "tags": ["configured"],
+            "source": "openclaw-config",
+        })
+    for provider, pdata in cfg.get("models", {}).get("providers", {}).items():
+        for m in pdata.get("models", []):
+            mid = f"{provider}/{m.get('id')}"
+            models.append({
+                "id": mid,
+                "key": mid,
+                "name": m.get("name") or m.get("id"),
+                "provider": provider,
+                "input": ",".join(m.get("input", [])) if isinstance(m.get("input"), list) else m.get("input"),
+                "contextWindow": m.get("contextWindow", 0),
+                "available": True,
+                "missing": False,
+                "tags": [],
+                "source": "openclaw-config",
+            })
+    deduped = {}
+    for model in models:
+        deduped[model["id"]] = {**deduped.get(model["id"], {}), **model}
+    return list(deduped.values())
+
+
+def _get_openclaw_native_fallback(reason=""):
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "models": [], "authProfiles": [], "agents": {}}
+    agents = {}
+    for agent in cfg.get("agents", {}).get("list", []):
+        agents[agent.get("id")] = {
+            "id": agent.get("id"),
+            "workspace": agent.get("workspace"),
+            "model": agent.get("model", ""),
+        }
+    models = _read_openclaw_config_models(cfg)
+    return {
+        "ok": True,
+        "warning": reason or "OpenClaw CLI unavailable; read mounted native config/auth store",
+        "models": models,
+        "authProfiles": _read_openclaw_auth_sqlite(),
+        "authStatus": {"storePath": os.path.join(OPENCLAW_AGENT_DIR, "openclaw-agent.sqlite"), "source": "sqlite-fallback"},
+        "defaultModel": cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""),
+        "agents": agents,
+        "providers": sorted({m["provider"] for m in models if m.get("provider")}),
+        "nativeCommands": {
+            "list": "openclaw models list --all --json",
+            "auth": "openclaw models auth list --json",
+            "status": "openclaw models status --json",
+            "assign": "openclaw config patch / agents.list[].model",
+        },
+    }
+
+
+def _get_openclaw_native_models():
+    """Return OpenClaw's native model/auth/catalog state."""
+    openclaw_bin = OPENCLAW_BIN
+    if not openclaw_bin:
+        return _get_openclaw_native_fallback("OpenClaw CLI binary unavailable in this container")
+    list_result = _run_json_command([openclaw_bin, "models", "list", "--all", "--json"], timeout=45)
+    auth_result = _run_json_command([openclaw_bin, "models", "auth", "list", "--json"], timeout=30)
+    status_result = _run_json_command([openclaw_bin, "models", "status", "--json"], timeout=30)
+
+    if not list_result.get("ok"):
+        return _get_openclaw_native_fallback(list_result.get("error") or "OpenClaw CLI model list failed")
+
+    models = []
+    if list_result.get("ok"):
+        for m in (list_result.get("data") or {}).get("models", []):
+            key = m.get("key") or m.get("id") or ""
+            if not key:
+                continue
+            models.append({
+                "id": key,
+                "key": key,
+                "name": m.get("name") or key.split("/", 1)[-1],
+                "provider": m.get("provider") or _provider_from_model_id(key),
+                "input": m.get("input"),
+                "contextWindow": m.get("contextWindow") or 0,
+                "available": bool(m.get("available", not m.get("missing", False))),
+                "missing": bool(m.get("missing", False)),
+                "local": bool(m.get("local", False)),
+                "tags": m.get("tags") or [],
+                "source": "openclaw",
+            })
+
+    auth_profiles = []
+    if auth_result.get("ok"):
+        auth_profiles = (auth_result.get("data") or {}).get("profiles", [])
+
+    status = status_result.get("data") if status_result.get("ok") else {}
+    agents = {}
+    default_model = ""
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        default_model = cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
+        for agent in cfg.get("agents", {}).get("list", []):
+            agents[agent.get("id")] = {
+                "id": agent.get("id"),
+                "workspace": agent.get("workspace"),
+                "model": agent.get("model", ""),
+            }
+    except Exception:
+        pass
+
+    return {
+        "ok": list_result.get("ok", False),
+        "error": list_result.get("error"),
+        "models": models,
+        "authProfiles": auth_profiles,
+        "authStatus": status.get("auth") if isinstance(status, dict) else None,
+        "defaultModel": default_model,
+        "agents": agents,
+        "providers": sorted({m["provider"] for m in models if m.get("provider")}),
+        "nativeCommands": {
+            "list": "openclaw models list --all --json",
+            "auth": "openclaw models auth list --json",
+            "status": "openclaw models status --json",
+            "assign": "openclaw config patch / agents.list[].model",
+        },
+    }
+
+
+def _load_yaml_file(path):
+    if not os.path.exists(path):
+        return {}
+    if yaml:
+        try:
+            with open(path, "r") as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+    # Minimal fallback parser for model and model_aliases when PyYAML is unavailable.
+    data = {}
+    current = None
+    current_alias = None
+    try:
+        with open(path, "r") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                if not line.startswith(" ") and line.endswith(":"):
+                    current = line[:-1].strip()
+                    current_alias = None
+                    data.setdefault(current, {})
+                    continue
+                if current and line.startswith("  ") and ":" in line:
+                    key, value = line.strip().split(":", 1)
+                    value = value.strip().strip("\"'")
+                    if current == "model_aliases" and not raw.startswith("    ") and not value:
+                        current_alias = key.strip()
+                        data.setdefault(current, {}).setdefault(current_alias, {})
+                    elif current == "model_aliases" and current_alias and raw.startswith("    "):
+                        data.setdefault(current, {}).setdefault(current_alias, {})[key.strip()] = value
+                    else:
+                        data.setdefault(current, {})[key.strip()] = value
+    except Exception:
+        return {}
+    return data
+
+
+def _hermes_profile_config_path(profile_id):
+    profile_id = str(profile_id or "default")
+    if profile_id in ("", "default"):
+        return os.path.join(HERMES_HOME, "config.yaml")
+    return os.path.join(HERMES_HOME, "profiles", profile_id, "config.yaml")
+
+
+def _hermes_args(profile_id, *extra):
+    args = [HERMES_BIN]
+    if profile_id and profile_id != "default":
+        args += ["--profile", profile_id]
+    args += list(extra)
+    return args
+
+
+def _hermes_env():
+    env = dict(os.environ)
+    env["HERMES_HOME"] = HERMES_HOME
+    return env
+
+
+def _parse_hermes_auth_list(text_out):
+    providers = []
+    current = None
+    for raw in (text_out or "").splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if not line.startswith(" ") and line.endswith(":"):
+            current = {"provider": line[:-1], "credentials": []}
+            providers.append(current)
+        elif current and line.strip().startswith("#"):
+            parts = line.strip().split()
+            current["credentials"].append({
+                "label": " ".join(parts[1:-2]) if len(parts) > 3 else line.strip(),
+                "type": parts[-2] if len(parts) >= 2 else "",
+                "source": parts[-1].replace("←", "") if parts else "",
+                "raw": line.strip(),
+            })
+    return providers
+
+
+def _get_hermes_profile_auth(profile_id):
+    paths = []
+    if profile_id and profile_id != "default":
+        paths.append(os.path.join(HERMES_HOME, "profiles", profile_id, "auth.json"))
+    paths.append(os.path.join(HERMES_HOME, "auth.json"))
+    merged = {}
+    for path in paths:
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        for provider, state in (data.get("providers") or {}).items():
+            merged.setdefault(provider, {"provider": provider, "credentials": []})
+            if state:
+                mode = state.get("auth_mode") or state.get("type") or "oauth"
+                merged[provider]["credentials"].append({
+                    "label": provider,
+                    "type": mode,
+                    "source": "auth.json",
+                })
+        for provider, entries in (data.get("credential_pool") or {}).items():
+            if not entries:
+                continue
+            merged.setdefault(provider, {"provider": provider, "credentials": []})
+            for entry in entries:
+                merged[provider]["credentials"].append({
+                    "label": entry.get("label") or entry.get("id") or provider,
+                    "type": entry.get("auth_type") or "",
+                    "source": entry.get("source") or "credential_pool",
+                })
+    return list(merged.values())
+
+
+def _get_hermes_native_models():
+    """Return Hermes profile/model/auth state using Hermes' native config layout."""
+    profiles = []
+    default_cfg = _load_yaml_file(os.path.join(HERMES_HOME, "config.yaml"))
+    if default_cfg:
+        profiles.append(("default", os.path.join(HERMES_HOME, "config.yaml")))
+    profiles_dir = os.path.join(HERMES_HOME, "profiles")
+    if os.path.isdir(profiles_dir):
+        for name in sorted(os.listdir(profiles_dir)):
+            cfg_path = os.path.join(profiles_dir, name, "config.yaml")
+            if os.path.exists(cfg_path):
+                profiles.append((name, cfg_path))
+
+    provider_cache = {}
+    cache_path = os.path.join(HERMES_HOME, "provider_models_cache.json")
+    try:
+        with open(cache_path, "r") as f:
+            cache_data = json.load(f)
+        for provider, entry in cache_data.items():
+            provider_cache[provider] = entry.get("models", []) if isinstance(entry, dict) else []
+    except Exception:
+        pass
+
+    result_profiles = []
+    for profile_id, cfg_path in profiles:
+        cfg = _load_yaml_file(cfg_path)
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        result_profiles.append({
+            "id": profile_id,
+            "configPath": cfg_path,
+            "provider": model_cfg.get("provider") or "",
+            "model": model_cfg.get("default") or model_cfg.get("model") or "",
+            "baseUrl": model_cfg.get("base_url") or "",
+            "auth": _get_hermes_profile_auth(profile_id),
+            "authOk": True,
+        })
+
+    models = []
+    for provider, names in provider_cache.items():
+        for name in names:
+            models.append({
+                "id": f"{provider}/{name}",
+                "provider": provider,
+                "name": name,
+                "source": "hermes",
+                "available": True,
+            })
+
+    model_aliases = {}
+    for profile_id, cfg_path in profiles:
+        cfg = _load_yaml_file(cfg_path)
+        aliases = cfg.get("model_aliases", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(aliases, dict):
+            continue
+        for alias, entry in aliases.items():
+            if not isinstance(entry, dict):
+                continue
+            provider = entry.get("provider") or "custom"
+            model = entry.get("model") or alias
+            base_url = entry.get("base_url") or ""
+            model_aliases[alias] = {
+                "alias": alias,
+                "profile": profile_id,
+                "provider": provider,
+                "model": model,
+                "baseUrl": base_url,
+            }
+            mid = f"{provider}/{model}"
+            if not any(m.get("id") == mid for m in models):
+                models.append({
+                    "id": mid,
+                    "provider": provider,
+                    "name": model,
+                    "source": "hermes-alias",
+                    "available": True,
+                    "baseUrl": base_url,
+                })
+
+    return {
+        "ok": bool(profiles),
+        "profiles": result_profiles,
+        "models": models,
+        "providers": sorted(set(provider_cache.keys()) | {m.get("provider") for m in models if m.get("provider")}),
+        "modelAliases": list(model_aliases.values()),
+        "nativeCommands": {
+            "setup": "hermes model",
+            "auth": "hermes auth list",
+            "assign": "hermes config set model.provider <provider>; hermes config set model.default <model>",
+        },
+    }
+
+
+def _get_native_model_state():
+    return {
+        "openclaw": _get_openclaw_native_models(),
+        "hermes": _get_hermes_native_models(),
+    }
+
+
+def _set_hermes_profile_model(profile_id, provider, model, base_url=""):
+    profile_id = str(profile_id or "default")
+    provider = str(provider or "").strip()
+    model = str(model or "").strip()
+    if not provider or not model:
+        return {"ok": False, "error": "provider and model are required"}
+    if re.search(r"[^a-zA-Z0-9_.:-]", provider):
+        return {"ok": False, "error": "invalid provider id"}
+    cfg_path = _hermes_profile_config_path(profile_id)
+    if not os.path.exists(cfg_path):
+        return {"ok": False, "error": f"Hermes profile config not found: {cfg_path}"}
+    try:
+        with open(cfg_path, "r") as f:
+            lines = f.read().splitlines()
+        output = []
+        in_model = False
+        seen_model = False
+        wrote = {"provider": False, "default": False, "base_url": False}
+        for line in lines:
+            stripped = line.strip()
+            if not line.startswith(" ") and stripped.endswith(":"):
+                if in_model:
+                    if not wrote["default"]:
+                        output.append(f"  default: {model}")
+                    if not wrote["provider"]:
+                        output.append(f"  provider: {provider}")
+                    if base_url and not wrote["base_url"]:
+                        output.append(f"  base_url: {str(base_url).strip()}")
+                in_model = stripped == "model:"
+                seen_model = seen_model or in_model
+                output.append(line)
+                continue
+            if in_model and line.startswith("  ") and ":" in line:
+                key = stripped.split(":", 1)[0]
+                if key == "default":
+                    output.append(f"  default: {model}")
+                    wrote["default"] = True
+                    continue
+                if key == "provider":
+                    output.append(f"  provider: {provider}")
+                    wrote["provider"] = True
+                    continue
+                if key == "base_url" and base_url:
+                    output.append(f"  base_url: {str(base_url).strip()}")
+                    wrote["base_url"] = True
+                    continue
+            output.append(line)
+        if in_model:
+            if not wrote["default"]:
+                output.append(f"  default: {model}")
+            if not wrote["provider"]:
+                output.append(f"  provider: {provider}")
+            if base_url and not wrote["base_url"]:
+                output.append(f"  base_url: {str(base_url).strip()}")
+        if not seen_model:
+            output.extend(["model:", f"  default: {model}", f"  provider: {provider}"])
+            if base_url:
+                output.append(f"  base_url: {str(base_url).strip()}")
+        with open(cfg_path, "w") as f:
+            f.write("\n".join(output) + "\n")
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "profile": profile_id, "provider": provider, "model": model}
+
+
+def _write_yaml_file(path, data):
+    if not yaml:
+        return False, "PyYAML is not available; cannot update Hermes YAML config"
+    try:
+        with open(path, "w") as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _yaml_scalar(value):
+    return json.dumps(str(value or ""))
+
+
+def _read_hermes_aliases_text(lines):
+    aliases = {}
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if line.strip() == "model_aliases:" and not line.startswith(" "):
+            start = i
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                nxt = lines[j]
+                if nxt.strip() and not nxt.startswith(" ") and not nxt.lstrip().startswith("#"):
+                    end = j
+                    break
+            break
+    if start is None:
+        return aliases, None, None
+    current = None
+    for line in lines[start + 1:end]:
+        if line.startswith("  ") and not line.startswith("    ") and line.strip().endswith(":"):
+            current = line.strip()[:-1]
+            aliases.setdefault(current, {})
+            continue
+        if current and line.startswith("    ") and ":" in line:
+            key, value = line.strip().split(":", 1)
+            aliases[current][key.strip()] = value.strip().strip("\"'")
+    return aliases, start, end
+
+
+def _write_hermes_aliases_text(path, aliases):
+    try:
+        with open(path, "r") as f:
+            lines = f.read().splitlines()
+    except Exception as e:
+        return False, str(e)
+    _, start, end = _read_hermes_aliases_text(lines)
+    block = []
+    if aliases:
+        block.append("model_aliases:")
+        for alias in sorted(aliases):
+            entry = aliases[alias] or {}
+            block.append(f"  {alias}:")
+            block.append(f"    model: {_yaml_scalar(entry.get('model') or alias)}")
+            block.append(f"    provider: {_yaml_scalar(entry.get('provider') or 'custom')}")
+            if entry.get("base_url"):
+                block.append(f"    base_url: {_yaml_scalar(entry.get('base_url'))}")
+    if start is None:
+        new_lines = lines + ([""] if lines and lines[-1].strip() else []) + block
+    else:
+        new_lines = lines[:start] + block + lines[end:]
+    try:
+        with open(path, "w") as f:
+            f.write("\n".join(new_lines).rstrip() + "\n")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _update_hermes_aliases_text(path, updater):
+    try:
+        with open(path, "r") as f:
+            lines = f.read().splitlines()
+    except Exception as e:
+        return None, False, str(e)
+    aliases, _, _ = _read_hermes_aliases_text(lines)
+    aliases = updater(aliases)
+    ok, err = _write_hermes_aliases_text(path, aliases)
+    return aliases, ok, err
+
+
+def _save_hermes_api_key(provider, api_key, label=""):
+    provider = _safe_provider_id(provider)
+    api_key = str(api_key or "").strip()
+    label = str(label or "Virtual Office").strip()[:80]
+    if not provider or not api_key:
+        return {"ok": False, "error": "provider and API key are required"}
+    if not HERMES_BIN:
+        return {"ok": False, "error": "Hermes CLI is not configured"}
+    args = [HERMES_BIN, "auth", "add", provider, "--type", "api-key", "--label", label, "--api-key", api_key]
+    result = _run_text_command(args, timeout=30, env=_hermes_env())
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("text") or "Hermes auth add failed"}
+    return {"ok": True, "provider": provider, "label": label, "maskedKey": _mask_secret(api_key)}
+
+
+def _delete_hermes_auth(provider, target):
+    provider = _safe_provider_id(provider)
+    target = str(target or "").strip()
+    if not provider or not target:
+        return {"ok": False, "error": "provider and credential label/id/index are required"}
+    if not HERMES_BIN:
+        return {"ok": False, "error": "Hermes CLI is not configured"}
+    result = _run_text_command([HERMES_BIN, "auth", "remove", provider, target], timeout=30, env=_hermes_env())
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("text") or "Hermes auth remove failed"}
+    return {"ok": True, "provider": provider, "target": target}
+
+
+def _save_hermes_custom_provider(profile_id, provider, base_url, models):
+    profile_id = str(profile_id or "default").strip() or "default"
+    provider = _safe_provider_id(provider) or "custom"
+    base_url = str(base_url or "").strip()
+    entries = _parse_model_entries(models)
+    if not base_url:
+        return {"ok": False, "error": "base URL is required"}
+    if not entries:
+        return {"ok": False, "error": "at least one model is required"}
+    cfg_path = _hermes_profile_config_path(profile_id)
+    if not os.path.exists(cfg_path):
+        return {"ok": False, "error": f"Hermes profile config not found: {cfg_path}"}
+    def update_aliases(aliases):
+        for entry in entries:
+            alias = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", entry["id"]).strip("-")[:100]
+            aliases[alias] = {
+                "model": entry["id"],
+                "provider": provider,
+                "base_url": base_url,
+            }
+        return aliases
+    if yaml:
+        cfg = _load_yaml_file(cfg_path)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        aliases = cfg.setdefault("model_aliases", {})
+        if not isinstance(aliases, dict):
+            aliases = {}
+            cfg["model_aliases"] = aliases
+        update_aliases(aliases)
+        ok, err = _write_yaml_file(cfg_path, cfg)
+        if not ok:
+            return {"ok": False, "error": err}
+    else:
+        _, ok, err = _update_hermes_aliases_text(cfg_path, update_aliases)
+        if not ok:
+            return {"ok": False, "error": err}
+    cache_path = os.path.join(HERMES_HOME, "provider_models_cache.json")
+    try:
+        with open(cache_path, "r") as f:
+            cache_data = json.load(f)
+    except Exception:
+        cache_data = {}
+    cache_data[provider] = {"models": [e["id"] for e in entries], "ts": int(time.time())}
+    try:
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception:
+        pass
+    return {"ok": True, "profile": profile_id, "provider": provider, "modelCount": len(entries)}
+
+
+def _delete_hermes_custom_provider(profile_id, provider):
+    profile_id = str(profile_id or "default").strip() or "default"
+    provider = _safe_provider_id(provider)
+    if not provider:
+        return {"ok": False, "error": "provider is required"}
+    cfg_path = _hermes_profile_config_path(profile_id)
+    if not os.path.exists(cfg_path):
+        return {"ok": False, "error": f"Hermes profile config not found: {cfg_path}"}
+    removed = []
+    def remove_aliases(aliases):
+        for alias, entry in list(aliases.items()):
+            if isinstance(entry, dict) and _safe_provider_id(entry.get("provider")) == provider:
+                removed.append(alias)
+                aliases.pop(alias, None)
+        return aliases
+    if yaml:
+        cfg = _load_yaml_file(cfg_path)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        aliases = cfg.get("model_aliases", {})
+        if isinstance(aliases, dict):
+            remove_aliases(aliases)
+        ok, err = _write_yaml_file(cfg_path, cfg)
+        if not ok:
+            return {"ok": False, "error": err}
+    else:
+        _, ok, err = _update_hermes_aliases_text(cfg_path, remove_aliases)
+        if not ok:
+            return {"ok": False, "error": err}
+    cache_path = os.path.join(HERMES_HOME, "provider_models_cache.json")
+    try:
+        with open(cache_path, "r") as f:
+            cache_data = json.load(f)
+        cache_data.pop(provider, None)
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception:
+        pass
+    return {"ok": True, "profile": profile_id, "provider": provider, "removedAliases": removed}
+
+
+def _save_openclaw_api_key(provider, api_key, profile_id=""):
+    provider = _safe_provider_id(provider)
+    api_key = str(api_key or "").strip()
+    profile_id = str(profile_id or f"{provider}:manual").strip()
+    if not provider or not api_key:
+        return {"ok": False, "error": "provider and API key are required"}
+    if not OPENCLAW_BIN:
+        return {"ok": False, "error": "OpenClaw CLI is not configured"}
+    try:
+        result = subprocess.run(
+            [OPENCLAW_BIN, "models", "auth", "paste-api-key", "--provider", provider, "--profile-id", profile_id],
+            input=api_key + "\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if result.returncode != 0:
+        return {"ok": False, "error": (result.stderr or result.stdout or "OpenClaw auth write failed").strip()}
+    return {"ok": True, "provider": provider, "profileId": profile_id, "maskedKey": _mask_secret(api_key)}
 
 # ─── DYNAMIC AGENT DISCOVERY ─────────────────────────────────
 from discovery import discover_all_agents, get_agent_workspace_dir, get_agent_session_id
-from providers.hermes import HermesProvider
+from providers.hermes import HermesApiClient, HermesProvider
 from providers.codex import CodexProvider, _get_proc as _get_codex_proc, _reset_proc as _reset_codex_proc
 from license import get_license_status, activate_license, deactivate_license, check_feature, get_agent_limit
 from project_store import MarkdownProjectStore
@@ -1732,9 +2579,8 @@ def _extract_hermes_turn_activity(exported_session, user_content):
 HERMES_TASK_BREAKDOWN_STEPS = [
     "Receive message from Virtual Office",
     "Load Hermes profile and current session",
-    "Run Hermes CLI agent loop",
-    "Wait for model, tools, and task updates",
-    "Export public session activity",
+    "Run Hermes request through the selected profile",
+    "Collect Hermes reply and public activity",
     "Render reply, tool calls, and task summary",
 ]
 
@@ -1748,12 +2594,98 @@ def _hermes_task_breakdown_tool(status="running", result=""):
         "status": status,
         "name": "Hermes task breakdown",
         "arguments": {"willDo": HERMES_TASK_BREAKDOWN_STEPS},
-        "result": result or "Running Hermes CLI agent loop and collecting public session activity.",
+        "result": result or "Running Hermes native API stream and collecting public activity.",
     }
+
+
+def _publish_hermes_api_progress(profile, agent_id, run_id, tools=None, reasoning_parts=None, reply=""):
+    """Publish in-flight native Hermes API events to the visible chat history."""
+    if not run_id:
+        return
+    progress_id = f"hermes-api-progress-{run_id}"
+    history = _load_hermes_history(profile)
+    history = [
+        msg for msg in history
+        if not (isinstance(msg, dict) and msg.get("ephemeral") == "hermes-progress" and msg.get("progressId") == progress_id)
+    ]
+    history.append({
+        "role": "assistant",
+        "text": reply or "",
+        "ts": int(time.time() * 1000),
+        "agentId": agent_id,
+        "ephemeral": "hermes-progress",
+        "progressId": progress_id,
+        "runId": run_id,
+        "sessionId": _get_hermes_session_id(profile) or "",
+        "tools": tools or [],
+        "thinking": "\n\n".join(reasoning_parts or [])[:12000],
+        "reasoningTokens": 0,
+    })
+    _save_hermes_history(profile, history)
 
 
 def _remove_hermes_progress_messages(messages):
     return [m for m in messages if not (isinstance(m, dict) and m.get("ephemeral") == "hermes-progress")]
+
+
+def _format_hermes_attachment_context(attachments):
+    if not isinstance(attachments, list) or not attachments:
+        return ""
+    lines = [
+        "Attachments provided by Virtual Office:",
+        "Use these attachments when answering. Prefer the URL if the local path is not readable from your runtime.",
+    ]
+    for idx, item in enumerate(attachments, 1):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("filename") or f"attachment-{idx}").strip()
+        path = str(item.get("path") or item.get("filePath") or "").strip()
+        url = str(item.get("url") or item.get("mediaUrl") or "").strip()
+        mime_type = str(item.get("mimeType") or item.get("contentType") or item.get("media_type") or "").strip()
+        size = item.get("size") or item.get("bytes") or ""
+        if path and not url:
+            url = "/chat-media?path=" + urllib.parse.quote(path)
+        if url.startswith("/"):
+            url = f"http://127.0.0.1:{PORT}{url}"
+        details = [f"{idx}. {name}"]
+        if mime_type:
+            details.append(f"type: {mime_type}")
+        if size:
+            details.append(f"size: {size} bytes")
+        if path:
+            details.append(f"path: {path}")
+        if url:
+            details.append(f"url: {url}")
+        lines.append(" | ".join(details))
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+def _hermes_tool_activity_messages(tools, agent_id="", run_id="", base_ts=None, coerce_complete=False):
+    """Store Hermes tools like OpenClaw recovered activity: one tool-only message per card."""
+    if not isinstance(tools, list) or not tools:
+        return []
+    start_ts = int(base_ts if base_ts is not None else time.time() * 1000)
+    messages = []
+    for idx, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            continue
+        item = dict(tool)
+        item["runId"] = item.get("runId") or run_id or ""
+        status = str(item.get("status") or "").lower()
+        if coerce_complete and status == "running":
+            item["status"] = "done"
+            if not item.get("result") or str(item.get("result")).strip().lower() == "running":
+                item["result"] = "Completed"
+        messages.append({
+            "role": "assistant",
+            "text": "",
+            "ts": start_ts + idx,
+            "agentId": agent_id,
+            "runId": item.get("runId") or run_id or "",
+            "tools": [item],
+            "source": "hermes-tool-activity",
+        })
+    return messages
 
 
 def _hermes_approval_key(agent_id="", profile="", session_id=""):
@@ -1915,11 +2847,310 @@ def _approval_result_message(approval, choice):
     }
 
 
-def _handle_hermes_chat(body):
-    """Send one message to a local Hermes agent via the public Hermes CLI.
+def _hermes_api_client():
+    hermes_cfg = VO_CONFIG.get("hermes", {})
+    return HermesApiClient(
+        base_url=hermes_cfg.get("apiUrl"),
+        api_key=hermes_cfg.get("apiKey"),
+        timeout_sec=min(int(hermes_cfg.get("timeoutSec") or 600), 60),
+    )
 
-    This is intentionally a conservative v0 bridge: no config writes, no raw
-    Hermes DB/log scraping, and stdout is treated as the assistant response.
+
+HERMES_PROFILE_API_LOCK = threading.Lock()
+HERMES_PROFILE_API_PROCESSES = {}
+
+
+def _parse_url_port(url, default=8642):
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+        return int(parsed.port or default)
+    except Exception:
+        return default
+
+
+def _hermes_profile_api_port(profile):
+    hermes_cfg = VO_CONFIG.get("hermes", {})
+    base = hermes_cfg.get("apiProfilePortBase") or os.environ.get("VO_HERMES_API_PROFILE_PORT_BASE")
+    try:
+        base = int(base)
+    except (TypeError, ValueError):
+        base = _parse_url_port(hermes_cfg.get("apiUrl"), 8642) + 1
+    digest = hashlib.sha1(str(profile or "default").encode("utf-8")).hexdigest()
+    return base + (int(digest[:6], 16) % 1000)
+
+
+def _hermes_profile_api_config(profile):
+    hermes_cfg = VO_CONFIG.get("hermes", {})
+    profile_cfgs = hermes_cfg.get("apiProfiles") if isinstance(hermes_cfg.get("apiProfiles"), dict) else {}
+    profile_cfg = profile_cfgs.get(profile) if isinstance(profile_cfgs.get(profile), dict) else {}
+    if profile == "default":
+        return {
+            "url": profile_cfg.get("apiUrl") or hermes_cfg.get("apiUrl"),
+            "key": profile_cfg.get("apiKey") or hermes_cfg.get("apiKey"),
+            "autoStart": False,
+        }
+    port = _hermes_profile_api_port(profile)
+    return {
+        "url": profile_cfg.get("apiUrl") or f"http://127.0.0.1:{port}",
+        "key": profile_cfg.get("apiKey") or hermes_cfg.get("apiKey"),
+        "autoStart": profile_cfg.get("autoStart", hermes_cfg.get("autoStartProfileApis", True)) is not False,
+        "port": port,
+    }
+
+
+def _hermes_api_client_for_profile(profile):
+    profile = profile or "default"
+    cfg = _hermes_profile_api_config(profile)
+    if profile != "default" and cfg.get("autoStart"):
+        _ensure_hermes_profile_api(profile, cfg)
+    return HermesApiClient(
+        base_url=cfg.get("url"),
+        api_key=cfg.get("key"),
+        timeout_sec=min(int(VO_CONFIG.get("hermes", {}).get("timeoutSec") or 600), 60),
+    )
+
+
+def _ensure_hermes_profile_api(profile, api_cfg):
+    """Start a profile-scoped Hermes API server when one is not already up."""
+    if not profile or profile == "default":
+        return
+    api_key = api_cfg.get("key") or ""
+    if not api_key:
+        return
+    client = HermesApiClient(
+        base_url=api_cfg.get("url"),
+        api_key=api_key,
+        timeout_sec=5,
+    )
+    if client.is_available():
+        return
+
+    with HERMES_PROFILE_API_LOCK:
+        proc = HERMES_PROFILE_API_PROCESSES.get(profile)
+        if proc and proc.poll() is None:
+            return
+
+        hermes_cfg = VO_CONFIG.get("hermes", {})
+        hermes_bin = os.path.expanduser(hermes_cfg.get("binary") or "~/.local/bin/hermes")
+        hermes_home = os.path.expanduser(hermes_cfg.get("homePath") or "~/.hermes")
+        if not os.path.exists(hermes_bin):
+            return
+
+        env = os.environ.copy()
+        env.update({
+            "API_SERVER_ENABLED": "true",
+            "API_SERVER_HOST": "127.0.0.1",
+            "API_SERVER_PORT": str(api_cfg.get("port") or _parse_url_port(api_cfg.get("url"), 8642)),
+            "API_SERVER_KEY": api_key,
+            "API_SERVER_MODEL_NAME": f"hermes-{HermesProvider._safe_suffix(profile)}",
+            "VO_HERMES_HOME": hermes_home,
+        })
+        if os.path.basename(hermes_home.rstrip(os.sep)) == ".hermes":
+            env["HOME"] = os.path.dirname(hermes_home.rstrip(os.sep)) or env.get("HOME", "")
+
+        log_path = os.path.join(STATUS_DIR, f"hermes-api-{HermesProvider._safe_suffix(profile)}.log")
+        try:
+            log_f = open(log_path, "ab", buffering=0)
+            proc = subprocess.Popen(
+                [hermes_bin, "--profile", profile, "gateway", "run"],
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+            HERMES_PROFILE_API_PROCESSES[profile] = proc
+        except Exception as exc:
+            print(f"⚠️ Hermes profile API start failed for {profile}: {exc}")
+            return
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            if client.is_available():
+                return
+        except Exception:
+            pass
+        proc = HERMES_PROFILE_API_PROCESSES.get(profile)
+        if proc and proc.poll() is not None:
+            return
+        time.sleep(0.5)
+
+
+def _hermes_event_tool_card(event, status="running", fallback_id=""):
+    tool = str(event.get("tool") or event.get("name") or event.get("tool_name") or "Hermes tool")
+    preview = str(event.get("preview") or event.get("label") or "")
+    duration = event.get("duration")
+    result = "Running" if status == "running" else "Completed"
+    if event.get("error"):
+        result = "Failed"
+    if duration is not None and status != "running":
+        result = f"{result} in {duration}s"
+    card = {
+        "id": str(event.get("toolCallId") or event.get("tool_call_id") or event.get("id") or fallback_id or f"hermes-tool-{int(time.time() * 1000)}"),
+        "name": tool,
+        "status": status,
+        "args_preview": preview,
+        "result": result,
+    }
+    if preview:
+        card["arguments"] = {"command": preview}
+    return card
+
+
+def _hermes_api_approval_from_event(event, agent_id="", profile="", session_id="", original_message=""):
+    command = str(event.get("command") or event.get("preview") or event.get("tool") or "Hermes approval request")
+    description = str(event.get("description") or "Hermes needs approval before it can continue this run.")
+    run_id = str(event.get("run_id") or "")
+    seed = f"{agent_id}|{profile}|{session_id}|{run_id}|{command}|{original_message}"
+    approval_id = "hermes-api-approval-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+    return {
+        "id": approval_id,
+        "approval_id": approval_id,
+        "provider": "hermes-api",
+        "kind": "dangerous_command",
+        "title": "Hermes approval required",
+        "description": description,
+        "command": command,
+        "message": original_message,
+        "agentId": agent_id or "hermes-default",
+        "profile": profile or "default",
+        "session_id": session_id or "",
+        "runId": run_id,
+        "choices": event.get("choices") or ["once", "deny"],
+        "status": "pending",
+        "createdAt": int(time.time() * 1000),
+    }
+
+
+def _handle_hermes_api_chat(agent, profile, delivery_message, original_message, timeout):
+    """Run a Hermes turn through the native Hermes API Server + SSE events."""
+    agent_id = agent.get("id") or agent.get("statusKey") or "hermes-default"
+    status_key = agent.get("statusKey") or agent_id
+    client = _hermes_api_client_for_profile(profile)
+    if not client.is_available():
+        return {"ok": False, "fallback": True, "error": "Hermes API Server is not available"}
+
+    session_id = _get_hermes_session_id(profile) or f"vo-hermes-{HermesProvider._safe_suffix(profile)}"
+    session_key = f"virtual-office:hermes:{profile}"
+    started = client.start_run(delivery_message, session_id=session_id, session_key=session_key)
+    run_id = started.get("run_id")
+    if not run_id:
+        return {"ok": False, "fallback": True, "error": started.get("error") or "Hermes API did not return a run_id"}
+
+    _set_hermes_session_id(profile, session_id)
+    gateway_presence.set_provider_event(status_key, "hermes", {"event": "run.started", "run_id": run_id})
+
+    reply = ""
+    reasoning_parts = []
+    tools = []
+    started_tools = {}
+    started_tool_keys = {}
+    tool_seq = 0
+    approval = None
+    terminal_event = None
+    error_text = ""
+    last_progress_publish = 0.0
+
+    def publish_progress(force=False):
+        nonlocal last_progress_publish
+        now = time.time()
+        if force or now - last_progress_publish >= 0.25:
+            _publish_hermes_api_progress(profile, agent_id, run_id, tools=tools, reasoning_parts=reasoning_parts, reply=reply)
+            last_progress_publish = now
+
+    publish_progress(force=True)
+
+    try:
+        for event in client.stream_run_events(run_id, timeout_sec=int(timeout) + 30):
+            gateway_presence.set_provider_event(status_key, "hermes", event)
+            event_name = str(event.get("event") or "").lower()
+            if event_name == "message.delta":
+                reply += str(event.get("delta") or "")
+                publish_progress()
+            elif event_name == "reasoning.available":
+                text = str(event.get("text") or "")
+                if text:
+                    reasoning_parts.append(text)
+                    publish_progress(force=True)
+            elif event_name == "tool.started":
+                tool_seq += 1
+                fallback_id = f"{run_id}:tool:{tool_seq}"
+                card = _hermes_event_tool_card(event, "running", fallback_id=fallback_id)
+                event_tool_key = f"{event.get('tool') or event.get('name') or 'tool'}:{event.get('preview') or event.get('label') or ''}"
+                started_tool_keys[event_tool_key] = card["id"]
+                started_tools[card["id"]] = card
+                tools.append(card)
+                publish_progress(force=True)
+            elif event_name in {"tool.completed", "tool.failed"}:
+                event_tool_key = f"{event.get('tool') or event.get('name') or 'tool'}:{event.get('preview') or event.get('label') or ''}"
+                fallback_id = started_tool_keys.get(event_tool_key)
+                if not fallback_id:
+                    matching_id = next((tid for tid, item in reversed(list(started_tools.items())) if item.get("name") == (event.get("tool") or event.get("name"))), "")
+                    fallback_id = matching_id or f"{run_id}:tool:{len(started_tools) + 1}"
+                card = _hermes_event_tool_card(event, "done" if event_name == "tool.completed" else "error", fallback_id=fallback_id)
+                if card["id"] in started_tools:
+                    started_tools[card["id"]].update(card)
+                else:
+                    tools.append(card)
+                publish_progress(force=True)
+            elif event_name == "approval.request":
+                approval = _remember_hermes_approval_pending(
+                    _hermes_api_approval_from_event(event, agent_id=agent_id, profile=profile, session_id=session_id, original_message=original_message),
+                    agent_id=agent_id,
+                    profile=profile,
+                    session_id=session_id,
+                )
+                publish_progress(force=True)
+                continue
+            elif event_name in {"run.completed", "run.failed", "run.cancelled", "run.canceled"}:
+                terminal_event = event
+                if event.get("output"):
+                    reply = str(event.get("output") or reply)
+                if event.get("error"):
+                    error_text = str(event.get("error") or "")
+                if event_name == "run.completed":
+                    approval = None
+                publish_progress(force=True)
+                break
+    except Exception as exc:
+        gateway_presence.set_provider_event(status_key, "hermes", {"event": "run.failed", "run_id": run_id, "error": str(exc)})
+        return {"ok": False, "error": str(exc), "providerPath": "api", "runId": run_id}
+
+    terminal_name = str((terminal_event or {}).get("event") or "").lower()
+    ok = terminal_name == "run.completed"
+    if approval:
+        ok = False
+        error_text = "Hermes is waiting for approval."
+    elif terminal_name in {"run.failed", "run.cancelled", "run.canceled"}:
+        ok = False
+        error_text = error_text or terminal_name.replace("run.", "Hermes run ")
+
+    thinking = "\n\n".join(reasoning_parts)
+    if thinking.strip() == reply.strip():
+        thinking = ""
+
+    return {
+        "ok": ok,
+        "reply": reply,
+        "stderr": "",
+        "exitCode": 0 if ok else 1,
+        "sessionId": session_id,
+        "runId": run_id,
+        "tools": tools,
+        "thinking": thinking,
+        "reasoningTokens": 0,
+        "approval": approval,
+        "error": error_text or None,
+        "providerPath": "api",
+    }
+
+
+def _handle_hermes_chat(body):
+    """Send one message to a local Hermes agent.
+
+    Prefer Hermes' native API Server run/SSE surface when available, then fall
+    back to the public Hermes CLI bridge for installs without the API server.
     """
     message = (body.get("message") or "").strip()
     agent_key = body.get("agentId") or body.get("key") or body.get("sessionKey") or "hermes-default"
@@ -1937,6 +3168,8 @@ def _handle_hermes_chat(body):
 
     from_type = str(body.get("fromType") or body.get("senderType") or "").strip().lower()
     is_human_source = from_type in {"human", "user", "chat", "ui"}
+    attachments = body.get("attachments") if isinstance(body.get("attachments"), list) else []
+    attachment_context = _format_hermes_attachment_context(attachments)
     source_app = str(body.get("sourceApp") or body.get("app") or "virtual-office").strip() or "virtual-office"
     source_surface = str(body.get("sourceSurface") or body.get("surface") or "chat-window").strip() or "chat-window"
     source_label = str(body.get("sourceLabel") or "").strip()
@@ -1951,6 +3184,8 @@ def _handle_hermes_chat(body):
             f"{message}\n\n"
             "Reply directly to the user. Do not assume the user's name unless they identify themselves."
         )
+    if attachment_context:
+        delivery_message = f"{delivery_message}\n\n{attachment_context}"
 
     now_ms = int(time.time() * 1000)
     history = _load_hermes_history(profile)
@@ -1964,6 +3199,7 @@ def _handle_hermes_chat(body):
         "sourceApp": source_app if is_human_source else "",
         "sourceSurface": source_surface if is_human_source else "",
         "sourceLabel": source_label if is_human_source else "",
+        "attachments": attachments,
     })
     _save_hermes_history(profile, history)
 
@@ -1975,13 +3211,12 @@ def _handle_hermes_chat(body):
         "agentId": agent.get("id"),
         "ephemeral": "hermes-progress",
         "progressId": progress_id,
-        "tools": [_hermes_task_breakdown_tool()],
-        "thinking": "Task plan queued: " + "; ".join(HERMES_TASK_BREAKDOWN_STEPS),
+        "tools": [],
+        "thinking": "Waiting for native Hermes API events.",
         "reasoningTokens": 0,
     })
     _save_hermes_history(profile, history)
 
-    gateway_presence.set_manual_override(agent.get("statusKey") or agent.get("id"), "working", "Hermes CLI task")
     try:
         provider = HermesProvider(
             home_path=hermes_cfg.get("homePath"),
@@ -1990,12 +3225,24 @@ def _handle_hermes_chat(body):
             timeout_sec=timeout,
         )
         session_id = _get_hermes_session_id(profile)
-        result = provider.send_chat_message(profile, delivery_message, session_id=session_id, timeout_sec=timeout, yolo_once=yolo_once)
+
+        result = None
+        used_api = False
+        if hermes_cfg.get("preferApi", True) and not yolo_once:
+            api_result = _handle_hermes_api_chat(agent, profile, delivery_message, message, timeout)
+            if not api_result.get("fallback"):
+                result = api_result
+                used_api = True
+
+        if result is None:
+            gateway_presence.set_manual_override(agent.get("statusKey") or agent.get("id"), "working", "Hermes CLI task")
+            result = provider.send_chat_message(profile, delivery_message, session_id=session_id, timeout_sec=timeout, yolo_once=yolo_once)
+
         if result.get("sessionId"):
             _set_hermes_session_id(profile, result.get("sessionId"))
-        activity = {"tools": [], "thinking": "", "reasoningTokens": 0}
+        activity = {"tools": result.get("tools") or [], "thinking": result.get("thinking") or "", "reasoningTokens": result.get("reasoningTokens") or 0}
         active_session_id = result.get("sessionId") or session_id
-        if active_session_id:
+        if not used_api and active_session_id:
             exported = provider.export_session(profile, active_session_id)
             if exported.get("ok"):
                 activity = _extract_hermes_turn_activity(exported.get("session"), delivery_message)
@@ -2004,9 +3251,11 @@ def _handle_hermes_chat(body):
         exit_code = result.get("exitCode")
         task_status = "done" if result.get("ok") else "error"
         task_result = "Hermes reply and session activity collected." if result.get("ok") else (result.get("error") or stderr or "Hermes request failed.")
-        task_tools = [_hermes_task_breakdown_tool(task_status, task_result)]
+        task_tools = [] if used_api else [_hermes_task_breakdown_tool(task_status, task_result)]
         visible_tools = task_tools + (activity.get("tools") or [])
-        approval = _detect_hermes_approval_request(reply, stderr, message, agent.get("id") or agent_key)
+        approval = result.get("approval")
+        if not approval:
+            approval = _detect_hermes_approval_request(reply, stderr, message, agent.get("id") or agent_key)
         if approval:
             approval = _remember_hermes_approval_pending(
                 approval,
@@ -2015,27 +3264,39 @@ def _handle_hermes_chat(body):
                 session_id=active_session_id or "",
             )
         history = _remove_hermes_progress_messages(_load_hermes_history(profile))
+        final_ts = int(time.time() * 1000)
+        history.extend(_hermes_tool_activity_messages(
+            visible_tools,
+            agent_id=agent.get("id"),
+            run_id=result.get("runId") or "",
+            base_ts=final_ts,
+            coerce_complete=bool(result.get("ok")) and not approval,
+        ))
         history.append({
             "role": "assistant",
             "text": reply,
-            "ts": int(time.time() * 1000),
+            "ts": final_ts + len(visible_tools),
             "agentId": agent.get("id"),
             "exitCode": exit_code,
             "sessionId": active_session_id,
-            "tools": visible_tools,
+            "runId": result.get("runId"),
+            "tools": [],
             "thinking": activity.get("thinking") or "",
             "reasoningTokens": activity.get("reasoningTokens") or 0,
             "approval": approval,
         })
         _save_hermes_history(profile, history)
-        state = "idle" if result.get("ok") else "offline"
-        gateway_presence.set_manual_override(agent.get("statusKey") or agent.get("id"), state, "")
+        if not used_api:
+            state = "idle" if result.get("ok") else "offline"
+            gateway_presence.set_manual_override(agent.get("statusKey") or agent.get("id"), state, "")
         return {
             "ok": bool(result.get("ok")),
             "reply": reply,
             "stderr": stderr[:2000],
             "exitCode": exit_code,
             "sessionId": active_session_id,
+            "runId": result.get("runId"),
+            "providerPath": result.get("providerPath") or ("api" if used_api else "cli"),
             "tools": visible_tools,
             "thinking": activity.get("thinking") or "",
             "reasoningTokens": activity.get("reasoningTokens") or 0,
@@ -2075,6 +3336,31 @@ def _handle_hermes_approval_respond(body):
     if not agent:
         return {"ok": False, "error": f"Hermes agent '{agent_key}' not found", "_status": 404}
     profile = agent.get("profile") or agent.get("providerAgentId") or "default"
+    if approval.get("provider") == "hermes-api" and approval.get("runId"):
+        run_id = str(approval.get("runId"))
+        api_choice = "deny" if choice == "deny" else "once"
+        try:
+            client = _hermes_api_client_for_profile(profile)
+            approved = client.respond_approval(run_id, api_choice)
+            history = _load_hermes_history(profile)
+            history.append(_approval_result_message({**approval, "agentId": agent.get("id") or agent_key, "message": message}, choice))
+            _save_hermes_history(profile, history)
+            if choice == "deny":
+                gateway_presence.set_provider_event(agent.get("statusKey") or agent.get("id"), "hermes", {"event": "run.cancelled", "run_id": run_id})
+                return {"ok": True, "choice": "deny", "providerPath": "api", "runId": run_id, "message": "Hermes approval denied."}
+
+            gateway_presence.set_provider_event(agent.get("statusKey") or agent.get("id"), "hermes", {"event": "approval.responded", "run_id": run_id})
+            return {
+                "ok": True,
+                "choice": "approve_once",
+                "approvalChoice": "approve_once",
+                "providerPath": "api",
+                "runId": run_id,
+                "sessionId": approval.get("session_id") or "",
+                "message": "Hermes approval approved. The active run will continue streaming.",
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "providerPath": "api", "runId": run_id, "_status": 500}
     if choice == "deny":
         history = _load_hermes_history(profile)
         history.append(_approval_result_message({**approval, "agentId": agent.get("id") or agent_key, "message": message}, "deny"))
@@ -2107,7 +3393,44 @@ def _handle_hermes_test(body=None):
     hermes_cfg = VO_CONFIG.get("hermes", {})
     hermes_bin = os.path.expanduser(body.get("binary") or hermes_cfg.get("binary") or "~/.local/bin/hermes")
     hermes_home = os.path.expanduser(body.get("homePath") or hermes_cfg.get("homePath") or "~/.hermes")
-    return HermesProvider(home_path=hermes_home, binary=hermes_bin, enabled=True).test()
+    result = HermesProvider(home_path=hermes_home, binary=hermes_bin, enabled=True).test()
+    api = _hermes_api_client_for_profile("default")
+    try:
+        caps = api.capabilities()
+        features = caps.get("features") if isinstance(caps.get("features"), dict) else {}
+        result["api"] = {
+            "ok": bool(features.get("run_submission") and features.get("run_events_sse")),
+            "url": api.base_url,
+            "features": {
+                "runSubmission": bool(features.get("run_submission")),
+                "runEventsSse": bool(features.get("run_events_sse")),
+                "runApprovalResponse": bool(features.get("run_approval_response")),
+            },
+        }
+    except Exception as exc:
+        result["api"] = {"ok": False, "url": api.base_url, "error": str(exc)[:500]}
+    profile_apis = {}
+    for agent in result.get("agents") or []:
+        profile = agent.get("profile") or agent.get("providerAgentId") or "default"
+        try:
+            profile_api = _hermes_api_client_for_profile(profile)
+            caps = profile_api.capabilities()
+            features = caps.get("features") if isinstance(caps.get("features"), dict) else {}
+            profile_apis[profile] = {
+                "ok": bool(features.get("run_submission") and features.get("run_events_sse")),
+                "url": profile_api.base_url,
+                "model": (caps.get("model") or caps.get("model_name") or ""),
+                "features": {
+                    "runSubmission": bool(features.get("run_submission")),
+                    "runEventsSse": bool(features.get("run_events_sse")),
+                    "runApprovalResponse": bool(features.get("run_approval_response")),
+                },
+            }
+        except Exception as exc:
+            cfg = _hermes_profile_api_config(profile)
+            profile_apis[profile] = {"ok": False, "url": cfg.get("url"), "error": str(exc)[:500]}
+    result["profileApis"] = profile_apis
+    return result
 
 
 def _handle_codex_test(body=None):
@@ -6175,7 +7498,10 @@ def _wf_get_task_session_messages(agent_id, project_id, task_id, max_messages=50
 
 def _wf_is_task_session_active(agent_id, project_id, task_id):
     if _is_hermes_agent(agent_id):
-        return False
+        agent = _get_hermes_agent(agent_id) or {}
+        key = agent.get("statusKey") or agent.get("id") or agent_id
+        presence = _get_normalized_presence_state().get(key, {})
+        return presence.get("state") in {"working", "finishing"} and str(presence.get("source") or "").startswith("hermes")
 
     """Check if the task-specific workflow session is still actively running."""
     session_key = _wf_task_session_key(agent_id, project_id, task_id)
@@ -6835,13 +8161,65 @@ class ApiUsageCollector:
             time.sleep(self.INTERVAL)
 
     def _read_profiles(self):
-        """Read auth profiles and return {profileId: profileData} for supported providers."""
+        """Read OpenClaw auth profiles from the configured native store."""
+        sqlite_profiles = self._read_profiles_from_sqlite()
+        if sqlite_profiles:
+            return sqlite_profiles
         try:
             with open(self._auth_profiles_path, "r") as f:
                 ap = json.load(f)
             return ap.get("profiles", {})
         except Exception:
             return {}
+
+    def _read_profiles_from_sqlite(self):
+        db_path = os.path.join(OPENCLAW_AGENT_DIR, "openclaw-agent.sqlite")
+        if not os.path.exists(db_path):
+            return {}
+        try:
+            con = sqlite3.connect(db_path)
+            con.row_factory = sqlite3.Row
+            table_names = [
+                row[0]
+                for row in con.execute("select name from sqlite_master where type='table'")
+            ]
+            for table in ("auth_profile_store", "auth_profile_stores"):
+                if table not in table_names:
+                    continue
+                cols = [row[1] for row in con.execute(f"pragma table_info({table})")]
+                if "store_json" not in cols:
+                    continue
+                for row in con.execute(f"select store_json from {table}").fetchall():
+                    try:
+                        data = json.loads(row["store_json"] or "{}")
+                    except Exception:
+                        continue
+                    profiles = data.get("profiles")
+                    if isinstance(profiles, dict) and profiles:
+                        con.close()
+                        return profiles
+            con.close()
+        except Exception:
+            return {}
+        return {}
+
+    def _profile_rank(self, profile):
+        """Prefer profiles that can expose real quota windows over plain API keys."""
+        prov = profile.get("provider", "")
+        has_token = bool(profile.get("access") or profile.get("token"))
+        has_key = bool(profile.get("key"))
+        ptype = str(profile.get("type") or profile.get("mode") or "").lower()
+        if prov in ("openai", "openai-codex") and has_token:
+            return 0
+        if prov == "anthropic" and has_token:
+            return 0
+        if prov == "github-copilot" and has_token:
+            return 1
+        if has_token or ptype in ("oauth", "token", "subscription"):
+            return 2
+        if has_key:
+            return 5
+        return 9
 
     def _collect(self):
         """Run one collection cycle across all configured providers."""
@@ -6851,12 +8229,22 @@ class ApiUsageCollector:
             return {"providers": [], "timestamp": now, "source": "no-profiles"}
 
         providers = []
-        seen = set()
-
+        grouped = {}
         for pid, profile in profiles.items():
-            prov = profile.get("provider", pid.split(":")[0])
-            if prov in seen:
+            if not isinstance(profile, dict):
                 continue
+            prov = profile.get("provider") or pid.split(":", 1)[0]
+            if not prov:
+                continue
+            profile = dict(profile)
+            profile["_profileId"] = pid
+            canonical = "openai" if prov == "openai-codex" else prov
+            grouped.setdefault(canonical, []).append(profile)
+
+        for canonical, provider_profiles in grouped.items():
+            provider_profiles.sort(key=self._profile_rank)
+            profile = provider_profiles[0]
+            prov = profile.get("provider") or canonical
 
             token = profile.get("access") or profile.get("token")
             api_key = profile.get("key")
@@ -6865,24 +8253,28 @@ class ApiUsageCollector:
             result = None
             if prov == "anthropic" and token:
                 result = self._fetch_claude(token, now)
-            elif prov == "openai-codex" and token:
+            elif prov in ("openai", "openai-codex") and token:
                 result = self._fetch_codex(token, account_id, now)
             elif prov == "github-copilot" and token:
                 result = self._fetch_copilot(token, now)
-            elif api_key and prov not in ("ollama", "lmstudio"):
-                # API key provider — no usage endpoint, just list it
+            elif api_key and canonical not in ("ollama", "lmstudio"):
                 result = {
-                    "provider": prov,
-                    "displayName": _PROVIDER_LABELS.get(prov, prov.replace("-", " ").title()),
+                    "provider": canonical,
+                    "displayName": _PROVIDER_LABELS.get(canonical, canonical.replace("-", " ").title()),
                     "type": "api_key",
                     "usage": None,
+                    "status": "configured",
+                    "message": "API key configured. This provider does not expose account quota windows through the standard API key interface.",
                 }
 
             if result:
+                result.setdefault("provider", canonical)
+                result.setdefault("profileId", profile.get("_profileId", ""))
+                result.setdefault("authType", str(profile.get("type") or profile.get("mode") or ("oauth" if token else "api_key")))
+                result.setdefault("profilesFound", len(provider_profiles))
                 providers.append(result)
-                seen.add(prov)
 
-        return {"providers": providers, "timestamp": now, "source": "direct-api"}
+        return {"providers": providers, "timestamp": now, "source": "openclaw-native-auth"}
 
     def _http_get(self, url, headers):
         """Make an HTTP GET request. Returns (status, response_body_dict_or_None)."""
@@ -6914,12 +8306,15 @@ class ApiUsageCollector:
         entry = {
             "provider": "anthropic",
             "displayName": _PROVIDER_LABELS.get("anthropic", "Claude"),
+            "type": "oauth",
         }
         if status != 200 or not data:
             msg = ""
             if data and isinstance(data, dict):
                 msg = data.get("error", {}).get("message", "") if isinstance(data.get("error"), dict) else str(data.get("error", ""))
             entry["error"] = f"HTTP {status}: {msg}" if msg else f"HTTP {status}"
+            if status == 429:
+                entry["message"] = "Claude usage endpoint is rate limited. Model access can still work; usage will refresh after the provider allows another check."
             return entry
 
         # Parse usage windows
@@ -6952,7 +8347,7 @@ class ApiUsageCollector:
 
     # --- OpenAI Codex ---
     def _fetch_codex(self, token, account_id, now):
-        """Fetch Codex/ChatGPT usage from OpenAI endpoint."""
+        """Fetch ChatGPT/Codex usage from OpenAI's OAuth-backed usage endpoint."""
         headers = {
             "Authorization": f"Bearer {token}",
             "User-Agent": "CodexBar",
@@ -6963,11 +8358,13 @@ class ApiUsageCollector:
 
         status, data = self._http_get("https://chatgpt.com/backend-api/wham/usage", headers)
         entry = {
-            "provider": "openai-codex",
-            "displayName": _PROVIDER_LABELS.get("openai-codex", "Codex"),
+            "provider": "openai",
+            "displayName": _PROVIDER_LABELS.get("openai", "OpenAI"),
+            "type": "oauth",
         }
         if status != 200 or not data:
             entry["error"] = f"HTTP {status}"
+            entry["message"] = "OpenAI usage requires a valid ChatGPT/Codex OAuth session. API-key billing usage is not exposed here."
             return entry
 
         windows = []
@@ -7462,6 +8859,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             models = self._get_models()
             self.wfile.write(json.dumps(models).encode())
+        elif self.path == "/api/native-models":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(_get_native_model_state()).encode())
         elif self.path == "/config/providers":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -7818,6 +9221,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     "homePath": VO_CONFIG.get("hermes", {}).get("homePath"),
                     "binary": VO_CONFIG.get("hermes", {}).get("binary"),
                     "timeoutSec": VO_CONFIG.get("hermes", {}).get("timeoutSec", 600),
+                    "apiUrl": VO_CONFIG.get("hermes", {}).get("apiUrl"),
+                    "apiKeyConfigured": bool(VO_CONFIG.get("hermes", {}).get("apiKey")),
+                    "preferApi": VO_CONFIG.get("hermes", {}).get("preferApi", True),
                     "detected": bool(_handle_hermes_test().get("ok")),
                 },
                 "license": {
@@ -8163,11 +9569,18 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
     def _discover_oauth_provider_models(cls):
         """Discover actually-served models for OAuth providers via `openclaw models list`.
 
-        This replaces stale config-based model lists with live discovery,
-        ensuring only models the provider actually serves are shown.
-        Runs for each OAuth provider, caches results for 10 minutes.
+        Read-only legacy helper for older picker surfaces. New model settings
+        use /api/native-models and OpenClaw's native JSON output directly.
         """
-        oauth_providers = ["openai-codex"]  # Add more OAuth providers here as needed
+        oauth_providers = set()
+        try:
+            for profile in _read_openclaw_auth_sqlite():
+                if str(profile.get("type") or "").lower() in {"oauth", "token", "subscription"}:
+                    provider = profile.get("provider")
+                    if provider:
+                        oauth_providers.add(provider)
+        except Exception:
+            pass
 
         for provider in oauth_providers:
             cached = cls._oauth_model_cache.get(provider)
@@ -8175,7 +9588,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 continue  # Still fresh
 
             try:
-                openclaw_bin = shutil.which("openclaw")
+                openclaw_bin = OPENCLAW_BIN
                 if not openclaw_bin:
                     continue
                 result = subprocess.run(
@@ -8193,8 +9606,6 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                         if key:
                             discovered.append(key)
 
-                # Update the config to reflect only discovered models
-                cls._sync_config_models(provider, discovered)
                 cls._oauth_model_cache[provider] = {"models": discovered, "ts": time.time()}
             except Exception:
                 pass  # Silently skip — will retry next cache expiry
@@ -8524,6 +9935,8 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 return self._handle_delete_key(request)
             elif req_type == "save-custom-provider":
                 return self._handle_save_custom_provider(request)
+            elif req_type == "delete-custom-provider":
+                return self._handle_delete_custom_provider(request)
             else:
                 return {"ok": False, "error": f"Unknown request type: {req_type}"}
         except Exception as e:
@@ -8609,8 +10022,10 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_delete_key(self, req):
         """Delete an API key from auth-profiles and openclaw.json."""
-        provider = req["provider"]
-        profile_id = req.get("profileId")
+        provider = _safe_provider_id(req.get("provider", ""))
+        profile_id = str(req.get("profileId") or "").strip()
+        if not provider and not profile_id:
+            return {"ok": False, "error": "provider or profileId is required"}
         deleted = []
 
         try:
@@ -8652,9 +10067,15 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_save_custom_provider(self, req):
         """Save a custom provider (ollama, lmstudio, etc.) to openclaw.json."""
-        provider = req["provider"]
-        base_url = req.get("baseUrl", "")
-        models = req.get("models", [])
+        provider = _safe_provider_id(req.get("provider", ""))
+        base_url = str(req.get("baseUrl", "") or "").strip()
+        models = _parse_model_entries(req.get("models", []))
+        if not provider:
+            return {"ok": False, "error": "provider is required"}
+        if not base_url:
+            return {"ok": False, "error": "base URL is required"}
+        if not models:
+            return {"ok": False, "error": "at least one model is required"}
 
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
@@ -8719,6 +10140,32 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
         self._signal_gateway(restart=False)
         return {"ok": True, "provider": provider, "modelCount": len(new_models)}
+
+    def _delete_custom_provider(self, provider):
+        return self._send_watcher_request({"type": "delete-custom-provider", "provider": provider})
+
+    def _handle_delete_custom_provider(self, req):
+        provider = _safe_provider_id(req.get("provider", ""))
+        if not provider:
+            return {"ok": False, "error": "provider is required"}
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        providers = cfg.setdefault("models", {}).setdefault("providers", {})
+        if provider not in providers:
+            return {"ok": False, "error": f"Provider {provider} is not configured"}
+        providers.pop(provider, None)
+        defaults_models = cfg.setdefault("agents", {}).setdefault("defaults", {}).setdefault("models", {})
+        for model_id in list(defaults_models.keys()):
+            if model_id.startswith(provider + "/"):
+                defaults_models.pop(model_id, None)
+        for agent in cfg.get("agents", {}).get("list", []):
+            if str(agent.get("model") or "").startswith(provider + "/"):
+                agent.pop("model", None)
+        ok, err = self._write_openclaw_config(cfg)
+        if not ok:
+            return {"ok": False, "error": err}
+        self._signal_gateway(restart=False)
+        return {"ok": True, "provider": provider}
 
     @staticmethod
     def _signal_gateway(restart=False):
@@ -9106,6 +10553,17 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 for key in body:
                     if key.startswith("_"):
                         continue
+                    if key == "hermes" and isinstance(body[key], dict) and isinstance(existing.get(key), dict):
+                        hermes_body = dict(body[key])
+                        # Password fields render blank/masked in the browser. A blank submit
+                        # should keep the existing server-side secret instead of disabling
+                        # native Hermes API auth.
+                        if not hermes_body.get("apiKey") and existing[key].get("apiKey"):
+                            hermes_body.pop("apiKey", None)
+                        if not hermes_body.get("apiUrl") and existing[key].get("apiUrl"):
+                            hermes_body.pop("apiUrl", None)
+                        existing[key].update(hermes_body)
+                        continue
                     if isinstance(body[key], dict) and isinstance(existing.get(key), dict):
                         existing[key].update(body[key])
                     else:
@@ -9469,6 +10927,113 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/agent-model":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = self._set_agent_model(body.get("agent", ""), body.get("model", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/auth/api-key":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _save_openclaw_api_key(body.get("provider", ""), body.get("apiKey", ""), body.get("profileId", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/auth/delete":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = self._delete_provider_key(body.get("provider", ""), body.get("profileId", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/provider":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = self._save_custom_provider(
+                _safe_provider_id(body.get("provider", "")),
+                body.get("baseUrl", ""),
+                _parse_model_entries(body.get("models", "")),
+                api=body.get("api", ""),
+                api_key=body.get("apiKey", ""),
+                timeout_seconds=body.get("timeoutSeconds", None),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/openclaw/provider/delete":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = self._delete_custom_provider(body.get("provider", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/profile-model":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _set_hermes_profile_model(
+                body.get("profile", "default"),
+                body.get("provider", ""),
+                body.get("model", ""),
+                body.get("baseUrl", ""),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/auth/api-key":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _save_hermes_api_key(body.get("provider", ""), body.get("apiKey", ""), body.get("label", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/auth/delete":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _delete_hermes_auth(body.get("provider", ""), body.get("target", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/provider":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _save_hermes_custom_provider(
+                body.get("profile", "default"),
+                body.get("provider", ""),
+                body.get("baseUrl", ""),
+                body.get("models", ""),
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path == "/api/native-models/hermes/provider/delete":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _delete_hermes_custom_provider(body.get("profile", "default"), body.get("provider", ""))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
         elif self.path == "/config/providers/save-key":
             length = int(self.headers.get('Content-Length', 0))
             body = json.loads(self.rfile.read(length)) if length else {}
@@ -9593,6 +11158,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 body = json.loads(self.rfile.read(length)) if length else {}
                 filename = os.path.basename(body.get("filename", "upload"))
+                mime_type = str(body.get("mimeType") or body.get("contentType") or mimetypes.guess_type(filename)[0] or "")
                 content = base64.b64decode(body.get("content", ""))
             except Exception as e:
                 self.send_response(400)
@@ -9613,7 +11179,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps({"path": dest, "size": len(content)}).encode())
+            self.wfile.write(json.dumps({
+                "path": dest,
+                "url": "/chat-media?path=" + urllib.parse.quote(dest),
+                "mimeType": mime_type,
+                "size": len(content)
+            }).encode())
             print(f"📎 Upload: {dest} ({len(content):,} bytes)")
 
         elif self.path == "/api/skills-library":

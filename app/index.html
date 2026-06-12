@@ -9,7 +9,7 @@
     <link rel="apple-touch-icon" href="icon-192.png">
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#1a1a2e">
-    <link rel="stylesheet" href="style.css?v=20260604-workspace-skill-workshop-queue">
+    <link rel="stylesheet" href="style.css?v=20260608-chat-scroll-old-behavior">
     <link rel="stylesheet" href="projects.css?v=0">
     <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
 </head>
@@ -54,7 +54,11 @@
                                 <input type="text" id="mm-hermes-home" class="mm-input" placeholder="/home/user/.hermes">
                                 <label class="mm-label">Hermes CLI <span style="color:#666;font-size:9px">server-side</span></label>
                                 <input type="text" id="mm-hermes-bin" class="mm-input" placeholder="/home/user/.local/bin/hermes">
-                                <div style="font-size:9px;color:#666;margin:4px 0 8px;">For Docker, mount the Hermes home/CLI into the container and use the mounted paths here.</div>
+                                <label class="mm-label">Hermes API URL <span style="color:#666;font-size:9px">native presence</span></label>
+                                <input type="text" id="mm-hermes-api-url" class="mm-input" placeholder="http://127.0.0.1:8642">
+                                <label class="mm-label">Hermes API Key <span style="color:#666;font-size:9px">server-side</span></label>
+                                <input type="password" id="mm-hermes-api-key" class="mm-input" placeholder="API_SERVER_KEY">
+                                <div style="font-size:9px;color:#666;margin:4px 0 8px;">For Docker, mount Hermes home/CLI into the container. Native live presence uses the Hermes API Server when available, with CLI fallback.</div>
                                 <button class="mm-btn mm-btn-primary" onclick="mmTestHermes()">🔍 Test Hermes</button>
                                 <div id="mm-hermes-status"></div>
                             </div>
@@ -795,7 +799,7 @@
         setTimeout(resizeCanvas, 320);
     }
     </script>
-    <script src="game.js?v=20260605-bubble-tool-preview-plain"></script>
+    <script src="game.js?v=20260608-object-queue-active-seed"></script>
     <script src="browser-panel.js?v=0"></script>
     <script src="projects.js?v=0"></script>
     <script>
@@ -938,11 +942,12 @@
         status.textContent = '';
         try {
             if (!_modelsCache) {
-                const res = await fetch('/models');
+                const res = await fetch('/api/native-models');
                 _modelsCache = await res.json();
             }
-            const data = _modelsCache;
-            const currentModel = (data.agentModels || {})[agent.statusKey] || data.defaultModel || '';
+            const nativeData = _modelsCache;
+            const data = nativeData.openclaw || {};
+            const currentModel = ((data.agents || {})[agent.statusKey] || {}).model || data.defaultModel || '';
             sel.innerHTML = '';
             const defOpt = document.createElement('option');
             defOpt.value = '';
@@ -952,6 +957,7 @@
             // Group models by provider
             const groups = {};
             for (const m of (data.models || [])) {
+                if (m.missing) continue;
                 const prov = m.provider || (m.id.includes('/') ? m.id.split('/')[0] : 'other');
                 if (!groups[prov]) groups[prov] = [];
                 groups[prov].push(m);
@@ -959,41 +965,18 @@
 
             // Provider display order and labels
             const provLabels = {
-                'anthropic': 'ANTHROPIC 🎫 OAuth',
-                'anthropic-token': 'ANTHROPIC 🎫 OAuth',
-                'anthropic-oauth': 'ANTHROPIC 🎫 OAuth',
-                'openai': 'OPENAI 🔑 API',
-                'openai-codex': 'OPENAI-CODEX 🎫 OAuth',
-                'openai-codex-oauth': 'OPENAI-CODEX 🎫 OAuth',
+                'anthropic': 'ANTHROPIC',
+                'openai': 'OPENAI',
                 'ollama': 'OLLAMA (Local)',
                 'lmstudio': 'LM STUDIO (Local)',
-                'google': 'GOOGLE'
+                'google': 'GOOGLE',
             };
 
-            // If OAuth/token variant exists, hide API group to avoid duplicate lists
-            if (groups['anthropic-token']) delete groups['anthropic'];
-            if (groups['openai-codex-oauth']) delete groups['openai-codex'];
-
-            // Merge duplicate provider groups (token/oauth variants → base oauth name)
-            const provMerge = {
-                'anthropic-token': 'anthropic-oauth',
-                'openai-codex': 'openai-codex-oauth',
-            };
-            for (const [from, to] of Object.entries(provMerge)) {
-                if (groups[from] && groups[to]) {
-                    groups[to].push(...groups[from]);
-                    delete groups[from];
-                } else if (groups[from]) {
-                    groups[to] = groups[from];
-                    delete groups[from];
-                }
-            }
-
-            const provOrder = ['anthropic', 'anthropic-oauth', 'openai', 'openai-codex-oauth', 'ollama', 'lmstudio', 'google'];
+            const provOrder = ['anthropic', 'openai', 'google', 'ollama', 'lmstudio'];
             const sortedProvs = [...new Set([...provOrder.filter(p => groups[p]), ...Object.keys(groups).filter(p => !provOrder.includes(p))])];
 
             for (const prov of sortedProvs) {
-                const provModels = groups[prov] || [];
+                const provModels = (groups[prov] || []).sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
                 if (provModels.length === 0) continue;
                 const label = provLabels[prov] || prov.toUpperCase();
                 const grp = document.createElement('optgroup');
@@ -1001,7 +984,8 @@
                 for (const m of provModels) {
                     const opt = document.createElement('option');
                     opt.value = m.id;
-                    opt.textContent = m.label || m.id;
+                    const ctx = m.contextWindow ? ' · ' + Math.round(m.contextWindow / 1000) + 'k' : '';
+                    opt.textContent = (m.name && m.name !== m.id ? m.id + ' · ' + m.name : m.id) + ctx;
                     if (m.id === currentModel) opt.selected = true;
                     grp.appendChild(opt);
                 }
@@ -1022,7 +1006,7 @@
         const model = sel.value;
         status.textContent = 'Applying...';
         try {
-            const res = await fetch('/set-model', {
+            const res = await fetch('/api/native-models/openclaw/agent-model', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ agent: agent.statusKey, model: model })
@@ -1041,10 +1025,10 @@
     </script>
     <!-- marked.js v15.0.12 - bundled locally for airgapped/offline use -->
     <script src="marked.min.js"></script>
-    <script src="chat.js?v=20260605-trajectory-progress-backfill"></script>
+    <script src="chat.js?v=20260612-chat-agent-persistence"></script>
     <script src="sms-panel.js?v=7"></script>
     <script src="pc-monitor.js?v=0"></script>
-    <script src="api-usage.js?v=0"></script>
+    <script src="api-usage.js?v=20260610-native-usage"></script>
     <script>
     // License check — demo watermark + feature gates
     (function() {

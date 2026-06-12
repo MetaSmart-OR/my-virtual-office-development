@@ -69,9 +69,10 @@
             const hasError = !!p.error;
 
             // Determine auth type
-            let authLabel = p.plan || p.type || '';
+            let authLabel = p.plan || p.authType || p.type || '';
             if (authLabel === 'oauth') authLabel = 'OAuth';
             else if (authLabel === 'api_key') authLabel = 'API Key';
+            else if (authLabel === 'token') authLabel = 'Token';
             let authColor = color;
 
             html += `<div class="pc-metric-row">`;
@@ -87,6 +88,9 @@
             // Error display
             if (hasError) {
                 html += `<div class="api-warning error" style="font-size:8px;margin:2px 0">${p.error}</div>`;
+            }
+            if (p.message) {
+                html += `<div class="pc-detail" style="margin-top:4px;opacity:0.7">${escapeHtml(p.message)}</div>`;
             }
 
             if (hasUsage) {
@@ -129,8 +133,10 @@
                 if (u.dailyPctLeft === 0) html += `<div class="api-warning exhausted">DAILY LIMIT REACHED</div>`;
                 if (u.weeklyPctLeft === 0) html += `<div class="api-warning exhausted">WEEKLY LIMIT REACHED</div>`;
             } else if (!hasError) {
-                // API key provider with no usage windows
-                html += `<div class="pc-detail" style="margin-top:4px;opacity:0.4">✓ Configured — no quota windows</div>`;
+                const fallback = p.status === 'configured'
+                    ? 'Configured - no quota windows available'
+                    : 'No quota windows available';
+                html += `<div class="pc-detail" style="margin-top:4px;opacity:0.55">${fallback}</div>`;
             }
 
             html += `</div>`;
@@ -158,6 +164,12 @@
         </div>`;
         html += `<div class="pc-bar-track"><div class="pc-bar" style="width:${usedPct}%;background:${getBarGrad(usedPct, color)}"></div></div>`;
         return html;
+    }
+
+    function escapeHtml(value) {
+        return String(value || '').replace(/[&<>"']/g, function(ch) {
+            return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch];
+        });
     }
 
     function getValColor(usedPct) {

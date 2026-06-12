@@ -3,7 +3,7 @@
 > Archive note: this completed implementation brief is retained for design history.
 
 ## Overview
-Build a character creation/editing panel that lets users create and customize pixel-art agents. The panel opens when clicking "👤 Agents" in the toolbar. All appearance data is stored in officeConfig and rendered data-driven.
+Build a character creation/editing panel that lets users create and customize 2D agents. The panel opens when clicking "👤 Agents" in the toolbar. All appearance data is stored in officeConfig and rendered data-driven.
 
 ## Current Agent Rendering (reference)
 Agents currently draw in this order in the `draw()` method:
