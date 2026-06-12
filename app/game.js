@@ -12716,6 +12716,17 @@ function _mmLoadCurrentSettings() {
         if (brCdpEl) brCdpEl.value = brCdp;
         if (brViewerEl) brViewerEl.value = brViewer;
         if (brFields) brFields.style.display = brEnabled ? "block" : "none";
+        // Codex
+        var codexCfg = cfg.codex || {};
+        var codexEnabled = codexCfg.enabled !== false;
+        var codexCb = document.getElementById("mm-codex-enable");
+        var codexFields = document.getElementById("mm-codex-fields");
+        var codexBin = document.getElementById("mm-codex-bin");
+        var codexHome = document.getElementById("mm-codex-home");
+        if (codexCb) codexCb.checked = codexEnabled;
+        if (codexFields) codexFields.style.display = codexEnabled ? "block" : "none";
+        if (codexBin) codexBin.value = codexCfg.binary || '';
+        if (codexHome) codexHome.value = codexCfg.home || '';
     }).catch(function(){});
     // Load display prefs from localStorage
     var prefs = {};
@@ -12755,6 +12766,45 @@ function _mmLoadCurrentSettings() {
         if (f) f.style.display = this.checked ? 'block' : 'none';
     });
 })();
+
+// Codex toggle in settings
+(function() {
+    var _cdxCb = document.getElementById('mm-codex-enable');
+    if (_cdxCb) _cdxCb.addEventListener('change', function() {
+        var f = document.getElementById('mm-codex-fields');
+        if (f) f.style.display = this.checked ? 'block' : 'none';
+    });
+})();
+
+function mmTestCodex() {
+    var statusEl = document.getElementById('mm-codex-status');
+    var enabled = !!(document.getElementById('mm-codex-enable') || {}).checked;
+    var binary = (document.getElementById('mm-codex-bin') || {}).value || '';
+    var home = (document.getElementById('mm-codex-home') || {}).value || '';
+    if (!enabled) {
+        statusEl.innerHTML = '<div class="mm-status info">Codex auto-detect is disabled.</div>';
+        return;
+    }
+    statusEl.innerHTML = '<div class="mm-status info">Saving and testing Codex...</div>';
+    fetch('/setup/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ codex: { enabled: enabled, binary: binary || null, home: home || null } })
+    }).then(function() {
+        return fetch('/api/codex/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ binary: binary || null, home: home || null }) });
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.ok) {
+            statusEl.innerHTML = '<div class="mm-status ok">✅ Codex OK' + (d.version ? ' — ' + d.version : '') + '</div>';
+        } else if (d.version && !d.authenticated) {
+            // Binary works but auth.json/OPENAI_API_KEY not detected server-side — chat still works via running proc
+            statusEl.innerHTML = '<div class="mm-status ok">✅ Codex found' + (d.version ? ' — ' + d.version : '') + '</div><div style="font-size:9px;color:#fa0;margin-top:4px;">Auth not auto-detected. Chat will still work if Codex is already running.</div>';
+        } else {
+            statusEl.innerHTML = '<div class="mm-status error">❌ ' + (d.error || 'Codex not found') + '</div>';
+        }
+    }).catch(function(e) {
+        statusEl.innerHTML = '<div class="mm-status error">❌ ' + e.message + '</div>';
+    });
+}
 
 function mmTestHermes() {
     var statusEl = document.getElementById('mm-hermes-status');
@@ -13000,6 +13050,17 @@ function mmSaveSettings() {
         config.browser = {
             cdpUrl: (_brCdp ? _brCdp.value.trim() : "") || null,
             viewerUrl: (_brViewer ? _brViewer.value.trim() : "") || null
+        };
+    }
+    // Codex
+    var _cdxCb = document.getElementById("mm-codex-enable");
+    var _cdxBin = document.getElementById("mm-codex-bin");
+    var _cdxHome = document.getElementById("mm-codex-home");
+    if (_cdxCb) {
+        config.codex = {
+            enabled: _cdxCb.checked,
+            binary: (_cdxBin ? _cdxBin.value.trim() : '') || null,
+            home: (_cdxHome ? _cdxHome.value.trim() : '') || null
         };
     }
 

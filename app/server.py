@@ -1959,12 +1959,12 @@ def _vo_projects_skill_content():
     office_url = f"http://127.0.0.1:{PORT}"
     return '''---
 name: VirtualOffice-Projects-and-Tasks
-description: "Inspect and work with Virtual Office projects, tasks, workflow status, and agent scores."
+description: "Create and manage Virtual Office projects, tasks, workflow, and agent scores. Agents can create projects, add tasks, assign them, and start the workflow autonomously."
 ---
 
 # VirtualOffice Projects and Tasks
 
-Use this to inspect visible project/task state.
+Use this to create projects, manage tasks, and run workflow pipelines — no human needed.
 
 ## Read projects
 
@@ -1974,24 +1974,67 @@ curl -sS {office_url}/api/projects/PROJECT_ID
 curl -sS {office_url}/api/projects/PROJECT_ID/workflow/status
 ```
 
-## Read scores
+## Read available agents
 
 ```bash
-curl -sS {office_url}/api/projects/scores
+curl -sS {office_url}/api/agents
 ```
+Returns a list of agents with their `id` fields — use these as `assignee` values.
+
+## Create a project
+
+```bash
+curl -sS -X POST {office_url}/api/projects \
+  -H 'Content-Type: application/json' \
+  -d '{{"title":"Project Title","description":"What this project delivers","priority":"high","createdBy":"YOUR_AGENT_ID"}}'
+```
+Returns `{{"ok": true, "project": {{"id": "PROJECT_ID", ...}}}}` — save the `id` for subsequent calls.
 
 ## Create a task
 
 ```bash
 curl -sS -X POST {office_url}/api/projects/PROJECT_ID/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"title":"Task title","description":"Task details","assignee":"AGENT_ID"}'
+  -d '{{"title":"Task title","description":"Concrete details of what to do","assignee":"AGENT_ID","priority":"high"}}'
 ```
+`assignee` must be an agent `id` from `/api/agents`. Create all tasks before starting the workflow.
+
+## Start workflow (agents execute tasks automatically)
+
+```bash
+curl -sS -X POST {office_url}/api/projects/PROJECT_ID/workflow/start \
+  -H 'Content-Type: application/json' \
+  -d '{{"autoMode": true}}'
+```
+`autoMode: true` means the pipeline runs all tasks sequentially without stopping. Tasks execute one at a time — each assigned agent works their task, then the pipeline picks the next.
+
+## Stop workflow
+
+```bash
+curl -sS -X POST {office_url}/api/projects/PROJECT_ID/workflow/stop \
+  -H 'Content-Type: application/json' \
+  -d '{{}}'
+```
+
+## Read scores
+
+```bash
+curl -sS {office_url}/api/projects/scores
+```
+
+## End-to-end autonomous flow
+
+1. `GET /api/agents` — discover available agent IDs
+2. `POST /api/projects` — create the project, capture `project.id`
+3. `POST /api/projects/{id}/tasks` — create each task with an `assignee`
+4. `POST /api/projects/{id}/workflow/start` with `autoMode: true` — pipeline runs all tasks
 
 ## Rules
 
-- Prefer project/task endpoints for durable work instead of private chat when the work belongs on a board.
-- Keep task titles short and descriptions concrete.
+- Always read `/api/agents` first to get real agent IDs before assigning tasks.
+- Create ALL tasks before starting the workflow — adding tasks mid-run is not reliable.
+- Use `autoMode: true` to run the full board without human intervention.
+- Keep task titles short and descriptions concrete so the executing agent knows exactly what to do.
 - Do not delete or reorder project data unless explicitly asked.
 '''.replace("{office_url}", office_url)
 
@@ -6247,6 +6290,17 @@ def _wf_call_agent(agent_id, message, timeout=600, project_id=None, task_id=None
         if result.get("ok"):
             return result.get("reply", "")
         return f"[ERROR] Hermes agent failed: {result.get('error') or result.get('reply') or result}"
+
+    if _is_codex_agent(agent_id):
+        codex_body = {"agentId": agent_id, "message": message}
+        chunks = []
+        def _collect(chunk): chunks.append(chunk.get("text") or chunk.get("content") or "")
+        try:
+            _handle_codex_chat_sse(codex_body, _collect)
+            reply = "".join(chunks).strip()
+            return reply if reply else "[ERROR] Codex returned empty response"
+        except Exception as e:
+            return f"[ERROR] Codex agent failed: {e}"
 
     # Use a stable session key per task — reused across all calls for this task
     session_key = None
@@ -10809,6 +10863,16 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             length = int(self.headers.get('Content-Length', 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_hermes_test(body)
+            self.send_response(200 if result.get("ok") else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+        elif self.path == "/api/codex/test":
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            result = _handle_codex_test(body)
             self.send_response(200 if result.get("ok") else 503)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")

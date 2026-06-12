@@ -63,6 +63,25 @@
                                 <div id="mm-hermes-status"></div>
                             </div>
                         </div>
+                        <!-- Codex Connection -->
+                        <div class="mm-section">
+                            <div class="mm-section-title">📦 Codex Connection</div>
+                            <label class="mm-label" style="display:flex;align-items:center;gap:6px;">
+                                <input type="checkbox" id="mm-codex-enable" checked> Auto-detect Codex Agents
+                            </label>
+                            <div style="font-size:9px;color:#666;margin:4px 0 8px;line-height:1.4;">
+                                Connects local Codex agents as first-class office agents. Uses the Codex CLI and home directory.
+                            </div>
+                            <div id="mm-codex-fields" style="margin-top:8px;">
+                                <label class="mm-label">Codex CLI <span style="color:#666;font-size:9px">server-side</span></label>
+                                <input type="text" id="mm-codex-bin" class="mm-input" placeholder="/home/user/.local/bin/codex">
+                                <label class="mm-label">Codex Home <span style="color:#666;font-size:9px">server-side</span></label>
+                                <input type="text" id="mm-codex-home" class="mm-input" placeholder="/home/user/.codex">
+                                <div style="font-size:9px;color:#666;margin:4px 0 8px;">For Docker, mount Codex home/CLI into the container.</div>
+                                <button class="mm-btn mm-btn-primary" onclick="mmTestCodex()">🔍 Test Codex</button>
+                                <div id="mm-codex-status"></div>
+                            </div>
+                        </div>
                         <!-- Office Settings -->
                         <div class="mm-section">
                             <div class="mm-section-title">🏢 Office</div>
