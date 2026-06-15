@@ -492,7 +492,9 @@ class CodexProvider:
                     err = event["error"]
                     err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                     _dbg("RECV", f"RPC error id={event['id']}: {err_msg}")
-                    continue
+                    sse_write({"type": "error", "text": f"Codex RPC error: {err_msg}"})
+                    gateway_presence.set_manual_override(agent_id, "idle", "")
+                    return server_thread_id
                 if self._handle_event(event, sse_write, agent_id):
                     return server_thread_id
 
@@ -543,10 +545,26 @@ class CodexProvider:
         elif method == "item/completed":
             sse_write({"type": "item_done"})
 
+        elif method == "error":
+            # Notification-style error from the app-server (no JSON-RPC id).
+            # willRetry=true means Codex is handling the retry internally — let it.
+            # willRetry=false means all retries exhausted; surface the error and stop.
+            if not params.get("willRetry"):
+                err = params.get("error") or {}
+                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                _dbg("EVENT", f"terminal error (willRetry=false): {err_msg[:200]}")
+                gateway_presence.set_manual_override(agent_id, "idle", "")
+                sse_write({"type": "error", "text": f"[ERROR] Codex: {err_msg}"})
+                return True
+
         elif method == "turn/completed":
-            output = params.get("output") or []
+            # Text arrives via delta events; turn.items is the fallback for
+            # synchronous content. params["output"] was never the right field —
+            # the actual data lives in params["turn"]["items"].
+            turn = params.get("turn") or {}
+            items = turn.get("items") or []
             full_text = ""
-            for item in output:
+            for item in items:
                 if not isinstance(item, dict):
                     continue
                 content = item.get("content", "")
@@ -556,8 +574,16 @@ class CodexProvider:
                     for part in content:
                         if isinstance(part, dict):
                             full_text += part.get("text", "") or part.get("output_text", "")
-            gateway_presence.set_manual_override(agent_id, "idle", "")
-            sse_write({"type": "done", "text": full_text})
+            # If turn failed, emit error instead of empty done
+            turn_status = turn.get("status", "")
+            if turn_status == "failed":
+                err = turn.get("error") or {}
+                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                gateway_presence.set_manual_override(agent_id, "idle", "")
+                sse_write({"type": "error", "text": f"[ERROR] Codex turn failed: {err_msg}"})
+            else:
+                gateway_presence.set_manual_override(agent_id, "idle", "")
+                sse_write({"type": "done", "text": full_text})
             return True
 
         return False

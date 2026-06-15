@@ -3508,6 +3508,11 @@ def _handle_codex_chat_sse(body: dict, sse_write) -> None:
         sse_write({"type": "error", "text": "Codex not available"})
         return
 
+    auth_status = provider.test()
+    if not auth_status.get("authenticated"):
+        sse_write({"type": "error", "text": auth_status.get("error") or "Codex not authenticated — run 'codex login' or set OPENAI_API_KEY"})
+        return
+
     thread_id = provider.get_or_create_thread_id(agent_key, STATUS_DIR)
     provider.stream_message(
         thread_id, message, sse_write, "codex",
@@ -5883,10 +5888,15 @@ def _wf_browser_exec_action_desc(command):
 
 def _wf_extract_session_activity(agent_id, project_id, task_id):
     if _is_hermes_agent(agent_id):
-        agent = _get_hermes_agent(agent_id) or {}
-        profile = agent.get("profile") or agent.get("providerAgentId") or "default"
-        messages = _load_hermes_history(profile)[-12:]
-        return [{"type": "message", "summary": (m.get("text") or "")[:300], "ts": m.get("ts", 0)} for m in messages if m.get("text")]
+        # Hermes has no OpenClaw tool-call sessions — return empty activity dict
+        return {
+            "files_read": [],
+            "files_edited": [],
+            "files_written": [],
+            "exec_commands": [],
+            "browser_actions": [],
+            "tool_call_count": 0,
+        }
 
     """Extract file activity and tool usage from a workflow task's session JSONL.
 
@@ -6294,7 +6304,11 @@ def _wf_call_agent(agent_id, message, timeout=600, project_id=None, task_id=None
     if _is_codex_agent(agent_id):
         codex_body = {"agentId": agent_id, "message": message}
         chunks = []
-        def _collect(chunk): chunks.append(chunk.get("text") or chunk.get("content") or "")
+        def _collect(chunk):
+            text = chunk.get("text") or chunk.get("content") or ""
+            if chunk.get("type") == "error" and text and not text.startswith("[ERROR]"):
+                text = f"[ERROR] {text}"
+            chunks.append(text)
         try:
             _handle_codex_chat_sse(codex_body, _collect)
             reply = "".join(chunks).strip()
@@ -6503,8 +6517,8 @@ def _wf_call_agent_http(agent_id, message, timeout, session_key=None):
                 return msg.get("content", "")
             return data.get("reply", data.get("text", str(data)))
     except urllib.error.HTTPError as e:
-        if e.code in (404, 405):
-            # Endpoint not available — fall back to CLI
+        if e.code in (401, 403, 404, 405):
+            # Endpoint not available or auth issue — fall back to WS then CLI
             return None
         body = ""
         try:
@@ -6895,10 +6909,79 @@ def _wf_run_pipeline(project_id, single_task=False):
         _wf_clear_persisted_state(project_id)
 
 
+def _wf_recover_stale_tasks(project_id, project):
+    """Move tasks stuck in In Progress/Review back to Backlog if stale (> 10 min with no active session)."""
+    import time as _time
+    inprogress_col = _wf_get_inprogress_col(project)
+    review_col = _wf_get_review_col(project)
+    backlog_col = _wf_get_backlog_col(project)
+    if not backlog_col:
+        return
+    active_col_ids = set()
+    if inprogress_col:
+        active_col_ids.add(inprogress_col["id"])
+    if review_col:
+        active_col_ids.add(review_col["id"])
+    if not active_col_ids:
+        return
+
+    stale_threshold_sec = 600  # 10 minutes
+    now_epoch = _time.time()
+    recovered = []
+
+    for task in project.get("tasks", []):
+        if task.get("columnId") not in active_col_ids:
+            continue
+        assignee = task.get("assignee")
+        if not assignee:
+            continue
+        # Check if a live session exists for this task
+        task_id = task.get("id")
+        session_active = _wf_is_task_session_active(assignee, project_id, task_id)
+        if session_active:
+            continue  # genuinely running — leave it alone
+        # Check how long it has been stuck
+        updated_raw = task.get("updatedAt") or task.get("createdAt") or ""
+        try:
+            from datetime import datetime, timezone
+            updated_dt = datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+            age_sec = now_epoch - updated_dt.timestamp()
+        except Exception:
+            age_sec = stale_threshold_sec + 1  # unknown age → treat as stale
+
+        if age_sec > stale_threshold_sec:
+            recovered.append(task_id)
+            print(f"[WORKFLOW] Auto-recovering stale task {task_id} (age={int(age_sec)}s) → Backlog")
+
+    if recovered:
+        data = _load_projects()
+        p = next((x for x in data["projects"] if x["id"] == project_id), None)
+        if p:
+            backlog_col2 = _wf_get_backlog_col(p)
+            if backlog_col2:
+                for task in p.get("tasks", []):
+                    if task.get("id") in recovered:
+                        task["columnId"] = backlog_col2["id"]
+                        task["updatedAt"] = _proj_now()
+                _log_activity(p, "auto_recovery", "workflow", f"Moved {len(recovered)} stale task(s) back to Backlog")
+                _save_projects(data)
+
+
 def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
     """Inner pipeline logic — wrapped by _wf_run_pipeline for error safety."""
     while not stop_flag.is_set():
         # Load fresh project data
+        data = _load_projects()
+        project = next((x for x in data["projects"] if x["id"] == project_id), None)
+        if not project:
+            break
+
+        # Auto-recover tasks stuck in In Progress/Review from a prior crashed run.
+        # If a task has been in an active column for > 10 minutes with no active
+        # session, assume it is stale and move it back to Backlog so the pipeline
+        # can re-process it rather than blocking indefinitely.
+        _wf_recover_stale_tasks(project_id, project)
+        # Reload after potential recovery
         data = _load_projects()
         project = next((x for x in data["projects"] if x["id"] == project_id), None)
         if not project:
@@ -6979,6 +7062,18 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
         agent_response = _wf_call_agent(assignee, prompt, project_id=project_id, task_id=task_id)
 
         if stop_flag.is_set():
+            break
+
+        # Bail out immediately if the agent call failed — do NOT move to review
+        if agent_response and str(agent_response).startswith("[ERROR]"):
+            print(f"[WORKFLOW] Agent call failed for task {task_id}: {agent_response[:200]}")
+            with _WORKFLOW_LOCK:
+                wf["phase"] = "error"
+                wf["error"] = agent_response
+                wf["active"] = False
+            _wf_sync_project_workflow_meta(project_id, active=False, phase="error",
+                                           current_task_id=task_id, active_agent=assignee)
+            _wf_persist_state(project_id)
             break
 
         # Update task file with agent response + file activity
@@ -7186,6 +7281,19 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
                 rework_response = _wf_call_agent(assignee, rework_prompt, project_id=project_id, task_id=task_id)
 
                 if stop_flag.is_set():
+                    break
+
+                # Bail out if rework agent call failed
+                if rework_response and str(rework_response).startswith("[ERROR]"):
+                    print(f"[WORKFLOW] Rework agent call failed for task {task_id}: {rework_response[:200]}")
+                    with _WORKFLOW_LOCK:
+                        wf["phase"] = "error"
+                        wf["error"] = rework_response
+                        wf["active"] = False
+                    _wf_sync_project_workflow_meta(project_id, active=False, phase="error",
+                                                   current_task_id=task_id, active_agent=assignee)
+                    _wf_persist_state(project_id)
+                    task_done = False
                     break
 
                 rework_activity = _wf_extract_session_activity(assignee, project_id, task_id)
