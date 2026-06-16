@@ -6305,8 +6305,16 @@ def _wf_call_agent(agent_id, message, timeout=600, project_id=None, task_id=None
         codex_body = {"agentId": agent_id, "message": message}
         chunks = []
         def _collect(chunk):
+            chunk_type = chunk.get("type")
+            if chunk_type == "approval":
+                # Auto-approve tool/command executions in workflow context — no human
+                # in the loop to respond, so blocking here hangs the pipeline forever.
+                approval_id = chunk.get("id")
+                if approval_id:
+                    _handle_codex_approval_respond({"approvalId": approval_id, "choice": "allow"})
+                return
             text = chunk.get("text") or chunk.get("content") or ""
-            if chunk.get("type") == "error" and text and not text.startswith("[ERROR]"):
+            if chunk_type == "error" and text and not text.startswith("[ERROR]"):
                 text = f"[ERROR] {text}"
             chunks.append(text)
         try:

@@ -529,7 +529,7 @@ class CodexProvider:
             gateway_presence.set_manual_override(agent_id, "working", "Responding...")
             sse_write({"type": "delta", "text": delta})
 
-        elif method == "item/commandExecution/requestApproval":
+        elif method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
             _dbg("APPROVAL", f"requestApproval rpc_id={event.get('id')} params={json.dumps(params)}")
             approval_id = (
                 params.get("itemId")
@@ -538,7 +538,7 @@ class CodexProvider:
             )
             # Store both request params and the JSON-RPC id so we can respond correctly
             _pending_approvals[approval_id] = {"params": params, "rpc_id": event.get("id")}
-            reason = params.get("reason") or params.get("description") or "command execution"
+            reason = params.get("reason") or params.get("description") or method.split("/")[1]
             gateway_presence.set_manual_override(agent_id, "working", "Waiting for approval")
             sse_write({"type": "approval", "id": approval_id, "reason": reason})
 
