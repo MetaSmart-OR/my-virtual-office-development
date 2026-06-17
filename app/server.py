@@ -2,6 +2,8 @@
 """Virtual Office server.
 Serves static files, status JSON, and proxies WebSocket to the OpenClaw gateway.
 """
+import sys
+sys.stdout.reconfigure(line_buffering=True)
 import asyncio
 import base64
 import http.server
@@ -12253,6 +12255,14 @@ async def ws_proxy(client_ws):
         global _ws_proxy_connected_logged
         try:
             async for msg in client_ws:
+                try:
+                    d = json.loads(msg)
+                    method = d.get("method", "")
+                    if method in ("connect", "chat.send", "chat.abort"):
+                        sk = (d.get("params") or {}).get("sessionKey", "")
+                        print(f"[OPENCLAW WS] → {method} session={sk}")
+                except Exception as _log_exc:
+                    print(f"[OPENCLAW WS] → (non-json or parse error: {_log_exc})")
                 await gw.send(msg)
         except websockets.exceptions.ConnectionClosed:
             pass
@@ -12266,6 +12276,25 @@ async def ws_proxy(client_ws):
         global _ws_proxy_connected_logged
         try:
             async for msg in gw:
+                try:
+                    d = json.loads(msg)
+                    typ = d.get("type", "")
+                    ev = d.get("event", "")
+                    if typ == "event" and ev not in ("health", "tick"):
+                        payload = d.get("payload") or {}
+                        sk = payload.get("sessionKey", "")
+                        state = payload.get("state", "")
+                        stream = payload.get("stream", "")
+                        phase = (payload.get("data") or {}).get("phase", "") or payload.get("phase", "")
+                        role = payload.get("role", "") or (payload.get("message") or {}).get("role", "")
+                        txt = str((payload.get("content") or payload.get("text") or (payload.get("message") or {}).get("content") or ""))[:60]
+                        print(f"[OPENCLAW WS] ← event={ev} session={sk} stream={stream} phase={phase} role={role} state={state} txt={txt!r}")
+                    elif typ == "res":
+                        ok = d.get("ok")
+                        err = (d.get("error") or {}).get("message", "")
+                        print(f"[OPENCLAW WS] ← res id={str(d.get('id',''))[:16]} ok={ok}" + (f" err={err!r}" if err else ""))
+                except Exception:
+                    pass
                 await client_ws.send(msg)
         except websockets.exceptions.ConnectionClosed:
             pass

@@ -1843,6 +1843,8 @@
     pendingCallbacks[id] = (res) => {
       if (res.ok) {
         connected = true;
+        // Subscribe so the gateway pushes chat/agent/session.message events to this connection
+        rpc('sessions.subscribe', {}).catch(() => {});
         chatWindows.forEach(w => {
           w.setStatus('Connected ⚡', 'connected');
           if (w.isPrimary || w.root.classList.contains('open')) {
